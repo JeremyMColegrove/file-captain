@@ -34,6 +34,7 @@ import {
 	useState,
 	useTransition,
 } from "react";
+import { toast } from "sonner";
 
 import { Alert, AlertDescription, AlertTitle } from "~/components/ui/alert";
 import {
@@ -80,7 +81,6 @@ import {
 	SidebarTrigger,
 } from "~/components/ui/sidebar";
 import { Skeleton } from "~/components/ui/skeleton";
-import { Toaster } from "~/components/ui/sonner";
 import {
 	Table,
 	TableBody,
@@ -103,14 +103,13 @@ import { formatShortDate, formatSize } from "~/lib/format";
 import { cn } from "~/lib/utils";
 import { FilePreview } from "./file-preview";
 import { IndexingToast } from "./indexing-toast";
-import { type Message, MessageDialog } from "./message-dialog";
 import { SignOutButton } from "./sign-out-button";
 import { TypeIcon } from "./type-icon";
 import { Uploader } from "./uploader";
 
 type Action = "mkdir" | "rename" | "delete";
-/** An entry marked with Copy or Cut, waiting to be pasted into another folder. */
-type Clip = { mode: "copy" | "cut"; src: string; name: string };
+/** Entries of one folder marked with Copy or Cut, waiting to be pasted. */
+type Clip = { mode: "copy" | "cut"; dir: string; names: string[] };
 /**
  * The highlighted entries, by name within the folder at `path`. `anchor` is
  * the last plainly clicked one, where a Shift-click range starts; `lead` is
@@ -168,6 +167,59 @@ function sortEntries(entries: Entry[]) {
 				? -1
 				: 1,
 	);
+}
+
+/** `"a.jpg"` for one name, `3 items` for several. */
+function describe(names: string[]) {
+	return names.length === 1 ? `"${names[0]}"` : `${names.length} items`;
+}
+
+/**
+ * Starts a download without leaving the page. The request loads in a hidden
+ * iframe: a file arrives as a download and the iframe stays blank, while an
+ * error loads there as a page whose message is shown in a toast (navigating
+ * the window itself would replace the app with the error's JSON).
+ */
+function startDownload(
+	method: "GET" | "POST",
+	action: string,
+	fields: [string, string][],
+) {
+	const frame = document.createElement("iframe");
+	frame.name = `download-${crypto.randomUUID()}`;
+	frame.hidden = true;
+	document.body.append(frame);
+	frame.addEventListener("load", () => {
+		let message = "The file may have been moved or deleted.";
+		try {
+			// Some browsers fire load for the initial blank page too.
+			if (frame.contentWindow?.location.href === "about:blank") return;
+			const doc = frame.contentDocument;
+			const text = (doc?.querySelector("pre") ?? doc?.body)?.textContent;
+			message = JSON.parse(text ?? "").error.message ?? message;
+		} catch {
+			// Not our JSON error (or not readable): keep the generic message.
+		}
+		toast.error("Download failed", { description: message });
+		frame.remove();
+	});
+	// A started download doesn't need the iframe; remove it eventually.
+	setTimeout(() => frame.remove(), 10 * 60 * 1000);
+
+	const form = document.createElement("form");
+	form.method = method;
+	form.action = action;
+	form.target = frame.name;
+	for (const [name, value] of fields) {
+		const input = document.createElement("input");
+		input.type = "hidden";
+		input.name = name;
+		input.value = value;
+		form.append(input);
+	}
+	document.body.append(form);
+	form.submit();
+	form.remove();
 }
 
 /** Finder-style name for a copy in the same folder: "a copy.txt", "a copy 2.txt", … */
@@ -241,8 +293,13 @@ export function FileBrowser({
 	useEffect(() => {
 		const onKey = (e: KeyboardEvent) => {
 			if (e.key === "Escape" && !isForFocused(e)) setSelected(null);
-			// Cmd/Ctrl+F searches all folders instead of the browser's find.
-			if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "f") {
+			// Cmd/Ctrl+F searches all folders instead of the browser's find,
+			// except in a dialog (e.g. a text preview), where find is useful.
+			if (
+				(e.metaKey || e.ctrlKey) &&
+				e.key.toLowerCase() === "f" &&
+				!(e.target as Element).closest("[role=dialog], [role=alertdialog]")
+			) {
 				e.preventDefault();
 				setSearchOpen(true);
 			}
@@ -342,15 +399,13 @@ export function FileBrowser({
 				dir={upload.dir}
 				dropDir={dropDir}
 				onBusyChange={setUploading}
-				onDropped={() => {
-					if (dropDir) setUpload({ open: true, dir: dropDir });
-				}}
 				onOpenChange={(open) => setUpload((u) => ({ ...u, open }))}
-				onUploaded={refresh}
+				// Not `refresh`: that dims the folder, which would flicker every
+				// few seconds during a long batch.
+				onUploaded={() => router.refresh()}
 				open={upload.open}
 			/>
 			<IndexingToast />
-			<Toaster position="bottom-right" />
 		</ShellContext>
 	);
 }
@@ -566,34 +621,30 @@ export function FolderView({
 		return () => setDropDir(null);
 	}, [path, writable, setDropDir]);
 
-	// The open action dialog, and its input/submitting/error state.
+	// The open action dialog, and its input/submitting state.
 	const [dialog, setDialog] = useState<{
 		action: Action;
-		entry?: Entry;
+		/** The entry renamed, or the entries deleted. */
+		entries: Entry[];
 	} | null>(null);
 	const [value, setValue] = useState("");
 	const [submitting, setSubmitting] = useState(false);
-	const [dialogError, setDialogError] = useState<string | null>(null);
-	// The server reported the typed name as taken (e.g. created meanwhile).
-	const [conflict, setConflict] = useState<Message | null>(null);
-	const [pasting, setPasting] = useState(false);
-	const [pasteError, setPasteError] = useState<Message | null>(null);
+	// A paste or delete is running (see forEachName).
+	const [working, setWorking] = useState(false);
 	// The file shown in the full-screen preview.
 	const [preview, setPreview] = useState<Entry | null>(null);
 	const files = useMemo(() => rows.filter((e) => e.type === "file"), [rows]);
 
-	function open(action: Action, entry?: Entry) {
-		setDialog({ action, entry });
-		setValue(action === "rename" ? (entry?.name ?? "") : "");
-		setDialogError(null);
-		setConflict(null);
+	function open(action: Action, entries: Entry[] = []) {
+		setDialog({ action, entries });
+		setValue(action === "rename" ? (entries[0]?.name ?? "") : "");
 		setSubmitting(false);
 	}
 
 	const trimmed = value.trim();
-	const name = dialog?.entry?.name ?? "";
-	const src = join(path, name);
-	const kind = dialog?.entry?.type === "dir" ? "folder" : "file";
+	const targets = dialog?.entries ?? [];
+	const name = targets[0]?.name ?? "";
+	const kind = targets[0]?.type === "dir" ? "folder" : "file";
 	const dialogs: Record<
 		Action,
 		{
@@ -601,6 +652,8 @@ export function FolderView({
 			description: string;
 			confirm: string;
 			input: boolean;
+			/** The toast title when `run` fails. */
+			failure: string;
 			run: () => Promise<unknown>;
 		}
 	> = {
@@ -609,6 +662,7 @@ export function FolderView({
 			description: `Create a folder in ${path}.`,
 			confirm: "Create",
 			input: true,
+			failure: "Couldn't create the folder",
 			run: () => api("/api/files/mkdir", { path: join(path, trimmed) }),
 		},
 		rename: {
@@ -616,52 +670,83 @@ export function FolderView({
 			description: `Enter a new name for "${name}".`,
 			confirm: "Rename",
 			input: true,
-			run: () => api("/api/files/rename", { path: src, newName: trimmed }),
+			failure: `Couldn't rename "${name}"`,
+			run: () =>
+				api("/api/files/rename", {
+					path: join(path, name),
+					newName: trimmed,
+				}),
 		},
 		delete: {
-			title: `Delete ${kind}?`,
+			title:
+				targets.length > 1
+					? `Delete ${targets.length} items?`
+					: `Delete ${kind}?`,
 			description:
-				kind === "folder"
-					? `"${name}" and everything in it will be permanently deleted.`
-					: `"${name}" will be permanently deleted.`,
+				targets.length > 1
+					? targets.some((e) => e.type === "dir")
+						? `These ${targets.length} items, including everything in the folders among them, will be permanently deleted.`
+						: `These ${targets.length} items will be permanently deleted.`
+					: kind === "folder"
+						? `"${name}" and everything in it will be permanently deleted.`
+						: `"${name}" will be permanently deleted.`,
 			confirm: "Delete",
 			input: false,
-			run: () => api("/api/files/delete", { path: src }),
+			failure: "Couldn't delete",
+			run: () => removeEntries(targets.map((e) => e.name)),
 		},
 	};
 	const current = dialog ? dialogs[dialog.action] : null;
 
-	// The typed name can't be used: empty, unchanged, or already in the
-	// listing. Checked before submitting so predictable failures never reach
-	// the server. Names compare case-insensitively, since some disks (e.g.
-	// macOS) treat "Photo.jpg" and "photo.jpg" as the same file.
+	// Names compare case-insensitively: "Photo.jpg" and "photo.jpg" can't
+	// both exist (file-service enforces this too). The entry being renamed
+	// doesn't count, so only its capitalization can change.
 	const lower = trimmed.toLowerCase();
+	const taken = current?.input
+		? listing.entries.find(
+				(entry) =>
+					entry.name.toLowerCase() === lower &&
+					!(dialog?.action === "rename" && entry.name === name),
+			)
+		: undefined;
+	// Nothing to do: no name, or a rename to exactly the same name.
 	const nameBlocked =
 		!!current?.input &&
-		(!trimmed ||
-			(dialog?.action === "rename" && lower === name.toLowerCase()) ||
-			listing.entries.some((entry) => entry.name.toLowerCase() === lower));
+		(!trimmed || (dialog?.action === "rename" && trimmed === name));
 
 	async function confirm(e: React.FormEvent) {
 		e.preventDefault();
 		if (!current || nameBlocked) return;
+		if (!current.input) {
+			// Deleting shows its own progress, so the dialog needn't wait.
+			setDialog(null);
+			await current.run();
+			return;
+		}
+		// Checked here rather than by disabling the button, so the user is
+		// told why. The server checks again (it may have changed meanwhile).
+		if (taken) {
+			toast.error("Name already taken", {
+				description: `"${taken.name}" already exists in ${path}.${
+					taken.name === trimmed
+						? ""
+						: " Names that differ only in capitalization aren't allowed."
+				}`,
+			});
+			return;
+		}
 		setSubmitting(true);
-		setDialogError(null);
 		try {
 			await current.run();
-			if (current.input) select(trimmed);
+			select(trimmed);
 			setDialog(null);
 			refresh();
 		} catch (err) {
 			// Keep the dialog open so the user can fix the name and retry.
-			if (current.input && err instanceof ApiError && err.code === "CONFLICT") {
-				setConflict({
-					title: "Name already taken",
-					message: `An item named "${trimmed}" already exists in ${path}. Choose a different name.`,
-				});
-			} else {
-				setDialogError((err as Error).message);
-			}
+			const conflict = err instanceof ApiError && err.code === "CONFLICT";
+			toast.error(conflict ? "Name already taken" : current.failure, {
+				description: (err as Error).message,
+			});
 		}
 		setSubmitting(false);
 	}
@@ -671,27 +756,14 @@ export function FolderView({
 		selectedNames.includes(entry.name),
 	);
 	// Nothing can be pasted into the virtual root.
-	const canPaste = clip !== null && writable && path !== "/" && !pasting;
+	const canPaste = clip !== null && writable && path !== "/" && !working;
 
 	/** Downloads entries of this folder as one zip. A form POST, so the browser streams it to disk. */
 	function downloadZip(entries: Entry[]) {
-		const form = document.createElement("form");
-		form.method = "POST";
-		form.action = "/api/files/zip";
-		const fields = [
+		startDownload("POST", "/api/files/zip", [
 			["dir", path],
-			...entries.map((entry) => ["name", entry.name]),
-		];
-		for (const [name, value] of fields) {
-			const input = document.createElement("input");
-			input.type = "hidden";
-			input.name = name ?? "";
-			input.value = value ?? "";
-			form.append(input);
-		}
-		document.body.append(form);
-		form.submit();
-		form.remove();
+			...entries.map((entry): [string, string] => ["name", entry.name]),
+		]);
 	}
 
 	/** Opens a folder, or shows a file full-screen. */
@@ -707,115 +779,200 @@ export function FolderView({
 	}
 
 	function download(entry: Entry) {
-		window.location.href = `/api/files/download${q(join(path, entry.name))}`;
+		startDownload("GET", "/api/files/download", [
+			["path", join(path, entry.name)],
+		]);
+	}
+
+	/**
+	 * Runs `op` on each name in turn, then refreshes the folder. Several
+	 * names get a progress toast; the outcome is always reported in one.
+	 * Returns the names that succeeded.
+	 */
+	async function forEachName(
+		names: string[],
+		messages: {
+			/** e.g. "Deleting", shown as "Deleting 3 of 10…". */
+			progress: string;
+			/** e.g. "Couldn't delete", followed by the failed names. */
+			failure: string;
+			success: (done: string[]) => string;
+		},
+		op: (name: string) => Promise<unknown>,
+	) {
+		setWorking(true);
+		const total = names.length;
+		const id =
+			total > 1
+				? toast.loading(`${messages.progress} 1 of ${total}…`)
+				: undefined;
+		const done: string[] = [];
+		const failed: string[] = [];
+		let firstError = "";
+		for (const [i, name] of names.entries()) {
+			if (id !== undefined && i > 0) {
+				toast.loading(`${messages.progress} ${i + 1} of ${total}…`, { id });
+			}
+			try {
+				await op(name);
+				done.push(name);
+			} catch (err) {
+				failed.push(name);
+				firstError ||= (err as Error).message;
+			}
+		}
+		if (failed.length > 0) {
+			toast.error(`${messages.failure} ${describe(failed)}`, {
+				id,
+				description:
+					done.length > 0
+						? `${done.length} of ${total} succeeded. ${firstError}`
+						: firstError,
+			});
+		} else {
+			toast.success(messages.success(done), { id });
+		}
+		setWorking(false);
+		// Also after a failure: a copy may have stopped partway.
+		refresh();
+		return done;
+	}
+
+	/** Marks entries of this folder for pasting elsewhere. */
+	function clipEntries(mode: Clip["mode"], entries: Entry[]) {
+		const names = entries.map((e) => e.name);
+		setClip({ mode, dir: path, names });
+		toast(`${mode === "cut" ? "Cut" : "Copied"} ${describe(names)}`, {
+			description:
+				"Open a folder and paste with ⌘V / Ctrl+V, or right-click and choose Paste.",
+		});
 	}
 
 	async function paste() {
-		if (!clip || pasting) return;
-		let name = clip.name;
-		if (join(path, name) === clip.src) {
-			// Cutting and pasting into the same folder changes nothing.
-			if (clip.mode === "cut") return setClip(null);
-			name = copyName(
-				name,
-				listing.entries.map((e) => e.name),
-			);
+		if (!clip || working) return;
+		const { mode, dir, names } = clip;
+		// Cutting and pasting into the same folder changes nothing.
+		if (mode === "cut" && dir === path) return setClip(null);
+		const taken = listing.entries.map((e) => e.name);
+		const pasted: string[] = [];
+		const done = await forEachName(
+			names,
+			mode === "cut"
+				? {
+						progress: "Moving",
+						failure: "Couldn't move",
+						success: (done) => `Moved ${describe(done)} to ${path}`,
+					}
+				: {
+						progress: "Copying",
+						failure: "Couldn't copy",
+						success: (done) => `Copied ${describe(done)} to ${path}`,
+					},
+			async (name) => {
+				// A copy into its own folder gets a new name: "a copy.txt".
+				const dst = dir === path ? copyName(name, taken) : name;
+				taken.push(dst);
+				await api(mode === "cut" ? "/api/files/move" : "/api/files/copy", {
+					src: join(dir, name),
+					dst: join(path, dst),
+				});
+				pasted.push(dst);
+			},
+		);
+		// What failed to move stays on the clipboard to try again.
+		if (mode === "cut") {
+			const left = names.filter((n) => !done.includes(n));
+			setClip(left.length > 0 ? { ...clip, names: left } : null);
 		}
-		const dst = join(path, name);
-		setPasting(true);
-		try {
-			if (clip.mode === "cut") {
-				await api("/api/files/move", { src: clip.src, dst });
-				setClip(null);
-			} else {
-				await api("/api/files/copy", { src: clip.src, dst });
-			}
-			select(name);
-		} catch (err) {
-			setPasteError({
-				title: "Paste failed",
-				message: (err as Error).message,
-			});
+		const [first] = pasted;
+		const last = pasted[pasted.length - 1];
+		if (first && last) {
+			setSelected({ path, names: pasted, anchor: first, lead: last });
 		}
-		setPasting(false);
-		// Also after a failure: a copy may have stopped partway.
-		refresh();
+	}
+
+	async function removeEntries(names: string[]) {
+		const done = await forEachName(
+			names,
+			{
+				progress: "Deleting",
+				failure: "Couldn't delete",
+				success: (done) => `Deleted ${describe(done)}`,
+			},
+			(name) => api("/api/files/delete", { path: join(path, name) }),
+		);
+		if (done.length > 0) setSelected(null);
 	}
 
 	function actionsFor(entries: Entry[]): EntryAction[] {
 		const [entry] = entries;
 		if (!entry) return [];
+		const actions: EntryAction[] = [];
 		if (entries.length > 1) {
 			// Top-level folders (at "/") can't be zipped together.
-			if (path === "/") return [];
-			return [
-				{
+			if (path !== "/") {
+				actions.push({
 					label: "Download (.zip)",
 					icon: DownloadIcon,
 					run: () => downloadZip(entries),
+				});
+			}
+		} else if (entry.type === "dir") {
+			actions.push({
+				label: "Open",
+				icon: FolderOpenIcon,
+				run: () => openEntry(entry),
+			});
+			// Top-level folders (at "/") can't be zipped.
+			if (path !== "/") {
+				actions.push({
+					label: "Download (.zip)",
+					icon: DownloadIcon,
+					run: () => downloadZip([entry]),
+				});
+			}
+		} else {
+			actions.push(
+				{ label: "Open", icon: EyeIcon, run: () => openEntry(entry) },
+				{
+					label: "Download",
+					icon: DownloadIcon,
+					run: () => download(entry),
 				},
-			];
+			);
 		}
-		const actions: EntryAction[] =
-			entry.type === "dir"
-				? [
-						{
-							label: "Open",
-							icon: FolderOpenIcon,
-							run: () => openEntry(entry),
-						},
-						// Top-level folders (at "/") can't be zipped.
-						...(path === "/"
-							? []
-							: [
-									{
-										label: "Download (.zip)",
-										icon: DownloadIcon,
-										run: () => downloadZip([entry]),
-									},
-								]),
-					]
-				: [
-						{ label: "Open", icon: EyeIcon, run: () => openEntry(entry) },
-						{
-							label: "Download",
-							icon: DownloadIcon,
-							run: () => download(entry),
-						},
-					];
 		if (path === "/") return actions;
-		const src = join(path, entry.name);
 		if (!readOnly) {
 			actions.push({
 				label: "Copy",
 				icon: CopyIcon,
-				run: () => setClip({ mode: "copy", src, name: entry.name }),
+				run: () => clipEntries("copy", entries),
 			});
 		}
 		if (writable) {
-			actions.push(
-				{
-					label: "Cut",
-					icon: ScissorsIcon,
-					run: () => setClip({ mode: "cut", src, name: entry.name }),
-				},
-				{
+			actions.push({
+				label: "Cut",
+				icon: ScissorsIcon,
+				run: () => clipEntries("cut", entries),
+			});
+			if (entries.length === 1) {
+				actions.push({
 					label: "Rename",
 					icon: PencilIcon,
-					run: () => open("rename", entry),
-				},
-				{
-					label: "Delete",
-					icon: Trash2Icon,
-					run: () => open("delete", entry),
-					destructive: true,
-				},
-			);
+					run: () => open("rename", entries),
+				});
+			}
+			actions.push({
+				label: "Delete",
+				icon: Trash2Icon,
+				run: () => open("delete", entries),
+				destructive: true,
+			});
 		}
 		return actions;
 	}
 
-	const busy = shell.pending || pasting;
+	const busy = shell.pending || working;
 
 	/** Runs the selection's context-menu action with this label, if it has one. */
 	function runAction(label: string) {
@@ -938,8 +1095,9 @@ export function FolderView({
 			ContextMenu: openMenu,
 		};
 		if (key === "F10" && e.shiftKey) handlers.F10 = openMenu;
-		// Copy and cut work on one entry; otherwise the browser keeps them.
-		if ((key === "Mod+c" || key === "Mod+x") && !single) return;
+		// Without a selection, copy and cut stay the browser's.
+		if ((key === "Mod+c" || key === "Mod+x") && selectedEntries.length === 0)
+			return;
 		const handler = handlers[key];
 		if (!handler) return;
 		e.preventDefault();
@@ -1029,7 +1187,7 @@ export function FolderView({
 						<>
 							<ContextMenuItem disabled={!canPaste} onClick={paste}>
 								<ClipboardPasteIcon />
-								{clip ? `Paste "${clip.name}"` : "Paste"}
+								{clip ? `Paste ${describe(clip.names)}` : "Paste"}
 							</ContextMenuItem>
 							<ContextMenuItem
 								disabled={!writable}
@@ -1049,9 +1207,6 @@ export function FolderView({
 					)}
 				</ContextMenuContent>
 			</ContextMenu>
-
-			<MessageDialog message={pasteError} onClose={() => setPasteError(null)} />
-
 			<FilePreview
 				dir={path}
 				entries={files}
@@ -1080,18 +1235,9 @@ export function FolderView({
 								<Input
 									autoFocus
 									disabled={submitting}
-									onChange={(e) => {
-										setValue(e.target.value);
-										setDialogError(null);
-									}}
+									onChange={(e) => setValue(e.target.value)}
 									value={value}
 								/>
-							)}
-							{/* Space is reserved under an input so an error doesn't shift it. */}
-							{(current.input || dialogError) && (
-								<p className="min-h-5 text-destructive text-sm" role="alert">
-									{dialogError}
-								</p>
 							)}
 							<AlertDialogFooter>
 								<AlertDialogCancel disabled={submitting} type="button">
@@ -1109,8 +1255,6 @@ export function FolderView({
 							</AlertDialogFooter>
 						</form>
 					)}
-					{/* Nested, so closing it returns to the name input. */}
-					<MessageDialog message={conflict} onClose={() => setConflict(null)} />
 				</AlertDialogContent>
 			</AlertDialog>
 		</>
@@ -1189,20 +1333,24 @@ function FileTable({
 		scrollPaddingStart: 56,
 	});
 
-	// Brings the selected entry into view when a listing loads with one
-	// already selected, e.g. after opening a search result.
-	const selectedRef = useRef(selected);
-	selectedRef.current = selected;
-	useEffect(() => {
-		const index = rows.findIndex((e) => e.name === selectedRef.current[0]);
+	// Brings the selected entry into view when a folder opens with one
+	// already selected, e.g. after opening a search result. Only when the
+	// folder changes: a refresh (e.g. as uploads finish) mustn't scroll the
+	// list away from where the user is.
+	const scrollToSelected = useEffectEvent(() => {
+		const index = rows.findIndex((e) => e.name === selected[0]);
 		if (index >= 0) virtualizer.scrollToIndex(index, { align: "center" });
-	}, [rows, virtualizer]);
+	});
+	// biome-ignore lint/correctness/useExhaustiveDependencies: runs per folder, see above
+	useEffect(() => scrollToSelected(), [path]);
 
 	// Keeps the row moved to with the arrow keys in view.
-	useEffect(() => {
+	const scrollToLead = useEffectEvent(() => {
 		const index = rows.findIndex((e) => e.name === lead);
 		if (index >= 0) virtualizer.scrollToIndex(index);
-	}, [lead, rows, virtualizer]);
+	});
+	// biome-ignore lint/correctness/useExhaustiveDependencies: runs when the lead moves, see above
+	useEffect(() => scrollToLead(), [lead]);
 
 	const items = virtualizer.getVirtualItems();
 	const first = items[0];

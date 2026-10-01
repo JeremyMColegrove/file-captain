@@ -415,6 +415,11 @@ describe("mkdir", () => {
 		await expect(fs.mkdir(alice, "/shared/x/y")).rejects.toThrow(NotFound);
 	});
 
+	it("conflicts on a name that differs only in case", async () => {
+		await expect(fs.mkdir(alice, "/shared/DOCS")).rejects.toThrow(Conflict);
+		await expect(fs.mkdir(alice, "/shared/A.TXT")).rejects.toThrow(Conflict);
+	});
+
 	it("refuses read-only users and read-only folders", async () => {
 		await expect(fs.mkdir(guest, "/shared/new")).rejects.toThrow(Forbidden);
 		await expect(fs.mkdir(alice, "/archive/new")).rejects.toThrow(Forbidden);
@@ -448,6 +453,23 @@ describe("rename", () => {
 		expect(await readFile(path.join(dirs.shared, "c.txt"), "utf8")).toBe(
 			"keep",
 		);
+	});
+
+	it("allows changing only the case of a name", async () => {
+		await fs.rename(alice, "/shared/a.txt", "A.txt");
+		const names = await readdir(dirs.shared);
+		expect(names).toContain("A.txt");
+		expect(names).not.toContain("a.txt");
+	});
+
+	it("rejects a name another entry has in a different case", async () => {
+		await expect(fs.rename(alice, "/shared/a.txt", "PIC.jpg")).rejects.toThrow(
+			Conflict,
+		);
+		await expect(fs.rename(alice, "/shared/a.txt", "Docs")).rejects.toThrow(
+			Conflict,
+		);
+		expect(await readdir(dirs.shared)).toContain("a.txt");
 	});
 
 	it("rejects names with separators or dots", async () => {
@@ -566,6 +588,15 @@ describe("copy", () => {
 	it("never overwrites", async () => {
 		await expect(
 			fs.copy(alice, "/shared/a.txt", "/shared/pic.JPG"),
+		).rejects.toThrow(Conflict);
+	});
+
+	it("rejects a name that differs from an existing one only in case", async () => {
+		await expect(
+			fs.copy(alice, "/shared/a.txt", "/shared/PIC.jpg"),
+		).rejects.toThrow(Conflict);
+		await expect(
+			fs.move(alice, "/shared/docs/deep/b.txt", "/shared/A.TXT"),
 		).rejects.toThrow(Conflict);
 	});
 
@@ -744,6 +775,16 @@ describe("uploads", () => {
 		await expect(stat(staged())).rejects.toThrow();
 		const [entry] = await auditEntries();
 		expect(entry).toMatchObject({ action: "upload", result: "error" });
+	});
+
+	it("rejects uploads whose name differs from an existing one only in case", async () => {
+		await expect(fs.checkUpload(alice, "/shared/A.TXT", 1)).rejects.toThrow(
+			Conflict,
+		);
+		await expect(
+			fs.finalizeUpload(alice, staged(), "/shared/Pic.jpg"),
+		).rejects.toThrow(Conflict);
+		expect(await readdir(dirs.shared)).not.toContain("Pic.jpg");
 	});
 
 	it("finalizeUpload refuses read-only users", async () => {

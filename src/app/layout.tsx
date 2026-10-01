@@ -4,6 +4,7 @@ import type { Metadata } from "next";
 import { Geist, Inter } from "next/font/google";
 import { connection } from "next/server";
 import { Suspense } from "react";
+import { Toaster } from "~/components/ui/sonner";
 import { env } from "~/env";
 import { cn } from "~/lib/utils";
 
@@ -42,6 +43,13 @@ const geist = Geist({
 	variable: "--font-geist-sans",
 });
 
+// Lines toasts up with the upload panel (right-4) and keeps them above it
+// (--upload-panel-space is set by the panel while it shows).
+const toastOffset = {
+	right: 16,
+	bottom: "calc(var(--upload-panel-space, 0px) + 16px)",
+};
+
 export default function RootLayout({
 	children,
 }: Readonly<{ children: React.ReactNode }>) {
@@ -49,6 +57,12 @@ export default function RootLayout({
 		<html className={cn(geist.variable, "font-sans", inter.variable)} lang="en">
 			<body>
 				{children}
+				{/* Bottom-right, stacked above the upload panel while it shows. */}
+				<Toaster
+					mobileOffset={toastOffset}
+					offset={toastOffset}
+					position="bottom-right"
+				/>
 				<Suspense>
 					<RequestTimeMarker />
 				</Suspense>

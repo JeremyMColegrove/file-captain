@@ -166,12 +166,23 @@ async function audited<T>(
 	}
 }
 
-/** Throws Conflict if `dst` exists, unless it is the same file as `src` (case-only rename). */
+/**
+ * Throws Conflict if `dst`'s directory already has an entry with its name,
+ * ignoring case: "Photo.jpg" and "photo.jpg" can't both exist. `src` itself
+ * doesn't count, so a case-only rename is allowed. A missing directory is
+ * left for the operation itself to report.
+ */
 async function assertFree(dst: string, src?: string) {
-	const existing = await lstat(dst).catch(() => null);
-	if (!existing) return;
-	if (src && (await lstat(src)).ino === existing.ino) return;
-	throw new Conflict("An item with that name already exists");
+	const dir = path.dirname(dst);
+	const name = path.basename(dst).toLowerCase();
+	const self = src && path.dirname(src) === dir ? path.basename(src) : null;
+	const entries = await opendir(dir).catch(() => null);
+	if (!entries) return;
+	for await (const entry of entries) {
+		if (entry.name !== self && entry.name.toLowerCase() === name) {
+			throw new Conflict("An item with that name already exists");
+		}
+	}
 }
 
 /**
@@ -670,6 +681,7 @@ export function mkdir(user: AppUser, virtualPath: string) {
 		const target = resolveWritable(user, virtualPath);
 		if (!isValidName(path.basename(target.absPath)))
 			throw new BadRequest("Invalid name");
+		await assertFree(target.absPath);
 		await fsMkdir(target.absPath);
 		await indexAdded(target);
 	});
@@ -853,6 +865,7 @@ export function finalizeUpload(
 			// Re-checked: other uploads may have finished meanwhile.
 			const bytes = hasLimit(target.folder) ? await treeSize(stagedPath) : 0;
 			await assertSpace(target.folder, bytes);
+			await assertFree(target.absPath);
 			try {
 				// link() fails with EEXIST instead of replacing, unlike rename().
 				await link(stagedPath, target.absPath);
