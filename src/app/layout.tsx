@@ -3,7 +3,6 @@ import "~/styles/globals.css";
 import type { Metadata } from "next";
 import { Geist, Inter } from "next/font/google";
 import { cn } from "~/lib/utils";
-import { TRPCReactProvider } from "~/trpc/react";
 
 const inter = Inter({ subsets: ["latin"], variable: "--font-sans" });
 
@@ -23,9 +22,7 @@ export default function RootLayout({
 }: Readonly<{ children: React.ReactNode }>) {
 	return (
 		<html className={cn(geist.variable, "font-sans", inter.variable)} lang="en">
-			<body>
-				<TRPCReactProvider>{children}</TRPCReactProvider>
-			</body>
+			<body>{children}</body>
 		</html>
 	);
 }

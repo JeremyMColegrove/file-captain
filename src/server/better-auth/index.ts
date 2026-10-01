@@ -1,1 +1,1 @@
-export { auth } from "./config";
+export { authHandler, getAuth } from "./config";

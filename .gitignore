@@ -44,3 +44,9 @@ yarn-error.log*
 
 # idea files
 .idea
+
+# app config (contains passwords)
+/config.yaml
+
+# local test data (may contain sensitive files)
+/test/

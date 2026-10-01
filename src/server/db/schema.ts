@@ -1,24 +1,46 @@
 import { relations } from "drizzle-orm";
-import { boolean, index, pgTable, text, timestamp } from "drizzle-orm/pg-core";
+import {
+	bigint,
+	boolean,
+	doublePrecision,
+	index,
+	pgTable,
+	primaryKey,
+	text,
+	timestamp,
+} from "drizzle-orm/pg-core";
 
-export const posts = pgTable(
-	"post",
-	(d) => ({
-		id: d.integer().primaryKey().generatedByDefaultAsIdentity(),
-		name: d.varchar({ length: 256 }),
-		createdById: d
-			.varchar({ length: 255 })
-			.notNull()
-			.references(() => user.id),
-		createdAt: d
-			.timestamp({ withTimezone: true })
-			.$defaultFn(() => new Date())
-			.notNull(),
-		updatedAt: d.timestamp({ withTimezone: true }).$onUpdate(() => new Date()),
-	}),
+/**
+ * Disk usage per configured folder, for storageLimit. Measured with `du` at
+ * startup and adjusted by file-service after each change. A cache only: the
+ * filesystem stays authoritative.
+ */
+export const folderUsage = pgTable("folder_usage", {
+	folder: text("folder").primaryKey(),
+	bytes: bigint("bytes", { mode: "number" }).notNull(),
+	updatedAt: timestamp("updated_at").notNull(),
+});
+
+/**
+ * Every file and directory in the configured folders, for search. `path` is
+ * relative to the folder root (`/photos/a.jpg`; the root itself is `/`). A
+ * cache only: file-service keeps it in step with its own changes, and at
+ * startup re-reads each directory whose mtime differs from `mtimeMs`.
+ */
+export const fileIndex = pgTable(
+	"file_index",
+	{
+		folder: text("folder").notNull(),
+		path: text("path").notNull(),
+		parent: text("parent").notNull(),
+		name: text("name").notNull(),
+		isDir: boolean("is_dir").notNull(),
+		size: bigint("size", { mode: "number" }).notNull(),
+		mtimeMs: doublePrecision("mtime_ms").notNull(),
+	},
 	(t) => [
-		index("created_by_idx").on(t.createdById),
-		index("name_idx").on(t.name),
+		primaryKey({ columns: [t.folder, t.path] }),
+		index("file_index_parent_idx").on(t.folder, t.parent),
 	],
 );
 

@@ -9,7 +9,7 @@ export const env = createEnv({
 	server: {
 		BETTER_AUTH_SECRET:
 			process.env.NODE_ENV === "production"
-				? z.string()
+				? z.string().min(32)
 				: z.string().optional(),
 		BETTER_AUTH_URL: z.string().url().optional(),
 		DATABASE_URL: z.string().url(),

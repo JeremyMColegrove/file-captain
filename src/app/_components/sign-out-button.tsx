@@ -3,7 +3,7 @@
 import { useRouter } from "next/navigation";
 
 import { Button } from "~/components/ui/button";
-import { authClient } from "~/server/better-auth/client";
+import { authClient } from "~/lib/auth-client";
 
 export function SignOutButton() {
 	const router = useRouter();
@@ -15,7 +15,8 @@ export function SignOutButton() {
 				router.push("/sign-in");
 				router.refresh();
 			}}
-			variant="outline"
+			size="sm"
+			variant="ghost"
 		>
 			Sign out
 		</Button>

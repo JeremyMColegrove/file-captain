@@ -38,7 +38,10 @@ COPY --chown=nextjs:nodejs scripts/run-migrations.mjs ./scripts/run-migrations.m
 
 RUN chmod +x /app/scripts/docker-entrypoint.sh && mkdir -p /app/.next/cache && chown -R nextjs:nodejs /app
 
-USER nextjs
+# No USER here: the entrypoint starts as root only to apply PUID/PGID, then
+# drops to that user before running anything else.
+ENV PUID=1000
+ENV PGID=1000
 
 EXPOSE 3000
 

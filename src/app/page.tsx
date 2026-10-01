@@ -1,19 +1,18 @@
 import { redirect } from "next/navigation";
 import { Suspense } from "react";
 
-import { LatestPost } from "~/app/_components/post";
-import { SignOutButton } from "~/app/_components/sign-out-button";
+import { FileBrowser } from "~/app/_components/file-browser";
+import { SidebarProvider } from "~/components/ui/sidebar";
 import { getSession } from "~/server/better-auth/server";
-import { api, HydrateClient } from "~/trpc/server";
+import { findUser } from "~/server/config";
 
 export default function Home() {
 	return (
-		<main className="flex min-h-screen flex-col items-center justify-center gap-8 p-4">
-			<h1 className="font-bold text-3xl tracking-tight">File Captain</h1>
-			<Suspense fallback={<p className="text-muted-foreground">Loading...</p>}>
-				<SignedInContent />
-			</Suspense>
-		</main>
+		<Suspense
+			fallback={<p className="p-4 text-muted-foreground">Loading...</p>}
+		>
+			<SignedInContent />
+		</Suspense>
 	);
 }
 
@@ -21,20 +20,13 @@ async function SignedInContent() {
 	const session = await getSession();
 	if (!session) redirect("/sign-in");
 
-	void api.post.getLatest.prefetch();
-
 	return (
-		<HydrateClient>
-			<div className="flex flex-col items-center gap-4">
-				<p>
-					Signed in as{" "}
-					<span className="font-semibold">
-						{session.user.displayUsername ?? session.user.name}
-					</span>
-				</p>
-				<SignOutButton />
-				<LatestPost />
-			</div>
-		</HydrateClient>
+		<SidebarProvider>
+			<FileBrowser
+				// A UI hint only; file-service enforces read-only on every write.
+				readOnly={findUser(session.user.username ?? "")?.readOnly ?? true}
+				username={session.user.displayUsername ?? session.user.name}
+			/>
+		</SidebarProvider>
 	);
 }

@@ -1,0 +1,22 @@
+# Copy to config.yaml (or mount at /config/config.yaml in Docker).
+server:
+  cacheDir: /data/.cache
+  auditLog: /data/audit.jsonl
+  maxUploadSize: 10GB
+
+users:
+  - username: jeremy
+    password: "change-me"
+  - username: guest
+    password: "change-me-too"
+    readOnly: true
+
+folders:
+  - name: shared
+    path: /mnt/media/shared/global
+    users: all
+    storageLimit: 1000GB
+  - name: jeremy
+    path: /mnt/media/shared/jeremy
+    users: [jeremy]
+    storageLimit: 200GB

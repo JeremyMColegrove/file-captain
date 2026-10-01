@@ -26,6 +26,10 @@ services:
         condition: service_healthy
     env_file:
       - .env
+    environment:
+      # Files the app writes get this owner. Find yours with `id -u` / `id -g`.
+      PUID: 1000
+      PGID: 1000
     ports:
       - "3000:3000"
 volumes:
