@@ -15,7 +15,8 @@
 		"dev": "next dev",
 		"preview": "next build && next start",
 		"start": "next start",
-		"typecheck": "tsc --noEmit"
+		"typecheck": "tsc --noEmit",
+		"docker:build": "docker buildx build --platform linux/amd64,linux/arm64 -t <your-dockerhub-username>/file-captain:latest --push ."
 	},
 	"dependencies": {
 		"@base-ui/react": "^1.8.0",
