@@ -5,6 +5,13 @@
 import "./src/env.js";
 
 /** @type {import("next").NextConfig} */
-const config = {};
+const config = {
+	output: "standalone",
+	// Lets pages prerender a static shell (e.g. the dashboard skeletons) while
+	// deferring anything behind a Suspense boundary that reads per-request data
+	// (headers/cookies/auth) to render dynamically at request time instead of
+	// forcing the whole page to skip static generation.
+	cacheComponents: true,
+};
 
 export default config;
