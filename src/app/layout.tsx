@@ -1,32 +1,31 @@
 import "~/styles/globals.css";
 
-import { type Metadata } from "next";
+import type { Metadata } from "next";
 import { Geist, Inter } from "next/font/google";
-
-import { TRPCReactProvider } from "~/trpc/react";
 import { cn } from "~/lib/utils";
+import { TRPCReactProvider } from "~/trpc/react";
 
-const inter = Inter({subsets:['latin'],variable:'--font-sans'});
+const inter = Inter({ subsets: ["latin"], variable: "--font-sans" });
 
 export const metadata: Metadata = {
-  title: "File Captain",
-  description: "File Captain",
-  icons: [{ rel: "icon", url: "/favicon.ico" }],
+	title: "File Captain",
+	description: "File Captain",
+	icons: [{ rel: "icon", url: "/favicon.ico" }],
 };
 
 const geist = Geist({
-  subsets: ["latin"],
-  variable: "--font-geist-sans",
+	subsets: ["latin"],
+	variable: "--font-geist-sans",
 });
 
 export default function RootLayout({
-  children,
+	children,
 }: Readonly<{ children: React.ReactNode }>) {
-  return (
-    <html lang="en" className={cn(geist.variable, "font-sans", inter.variable)}>
-      <body>
-        <TRPCReactProvider>{children}</TRPCReactProvider>
-      </body>
-    </html>
-  );
+	return (
+		<html className={cn(geist.variable, "font-sans", inter.variable)} lang="en">
+			<body>
+				<TRPCReactProvider>{children}</TRPCReactProvider>
+			</body>
+		</html>
+	);
 }
