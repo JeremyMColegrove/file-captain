@@ -3,14 +3,18 @@ server:
   cacheDir: /data/.cache
   auditLog: /data/audit.jsonl
   maxUploadSize: 10GB
+  indexIntervalMinutes: 15             # rescan for outside changes; 0 = startup only
+  thumbnailConcurrency: 3              # thumbnails generated at once; 1-2 suits HDDs; 0 = off
 
 users:
-  - username: jeremy
-    password: "change-me"
-  - username: guest
-    password: "change-me-too"
+  - username: jeremy@example.com      # an email address
+    password: "change-me-to-something-long"   # 12-128 chars; quote it if it has symbols
+  - username: guest@example.com
+    password: "change-me-to-something-long-too"
     readOnly: true
 
+# Folder paths are paths *inside the container*. Map each one to a host
+# directory under the app's `volumes:` in docker-compose.yml.
 folders:
   - name: shared
     path: /mnt/media/shared/global
@@ -18,5 +22,10 @@ folders:
     storageLimit: 1000GB
   - name: jeremy
     path: /mnt/media/shared/jeremy
-    users: [jeremy]
+    users: [jeremy@example.com]
     storageLimit: 200GB
+  - name: family
+    path: /mnt/media/shared/family
+    users: [jeremy@example.com]        # read-write
+    readOnlyUsers: [guest@example.com] # list, download and thumbnails only
+                                        # (a user in both lists is read-only)

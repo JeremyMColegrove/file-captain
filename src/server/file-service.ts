@@ -1,6 +1,11 @@
-import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { constants, createReadStream } from "node:fs";
+import { once } from "node:events";
+import {
+	constants,
+	createReadStream,
+	type ReadStream,
+	type Stats,
+} from "node:fs";
 import {
 	copyFile,
 	mkdir as fsMkdir,
@@ -12,12 +17,13 @@ import {
 	readlink,
 	rm,
 	stat,
+	statfs,
 	symlink,
 	writeFile,
 } from "node:fs/promises";
 import path from "node:path";
 import { Readable } from "node:stream";
-import { promisify } from "node:util";
+import { ZipArchive } from "archiver";
 import sharp from "sharp";
 
 import { type AuditAction, writeAudit } from "./audit";
@@ -31,6 +37,7 @@ import {
 } from "./errors";
 import {
 	accessibleFolders,
+	canWriteFolder,
 	isValidName,
 	type ResolvedPath,
 	resolveVirtualPath,
@@ -53,8 +60,13 @@ export type Entry = {
 	size: number;
 	mtime: string;
 	thumbnail: boolean;
-	/** Top-level folders with a storageLimit only; `size` is then the cached usage. */
+	/**
+	 * Top-level folders only: `size` is then the used bytes out of `limit`.
+	 * That is the cached usage against storageLimit, or, for folders without
+	 * one (`disk: true`), the whole disk's usage.
+	 */
 	limit?: number;
+	disk?: boolean;
 };
 
 const THUMBNAIL_EXTENSIONS = new Set([
@@ -66,12 +78,12 @@ const THUMBNAIL_EXTENSIONS = new Set([
 	".avif",
 ]);
 
-/** Runs at most `max` jobs at once; the rest wait in line. */
-function limiter(max: number) {
+/** Runs at most `max()` jobs at once; the rest wait in line. */
+function limiter(max: () => number) {
 	let active = 0;
 	const waiting: (() => void)[] = [];
 	return async <T>(job: () => Promise<T>): Promise<T> => {
-		if (active < max) active++;
+		if (active < max()) active++;
 		else await new Promise<void>((resolve) => waiting.push(resolve));
 		try {
 			return await job();
@@ -84,8 +96,19 @@ function limiter(max: number) {
 	};
 }
 
-const limitSharp = limiter(3);
+const thumbnailConcurrency = () => getConfig().server.thumbnailConcurrency;
+const limitSharp = limiter(thumbnailConcurrency);
+// One thread per job, so limitSharp caps thumbnails at thumbnailConcurrency
+// cores (libvips otherwise uses every core per job). Each image is decoded once, so
+// libvips' operation cache would only hold memory.
+sharp.concurrency(1);
+sharp.cache(false);
 const thumbnailDir = () => path.join(getConfig().server.cacheDir, "thumbnails");
+
+/** Whether a file named `name` gets a thumbnail (never when they're off). */
+const hasThumbnail = (name: string) =>
+	thumbnailConcurrency() > 0 &&
+	THUMBNAIL_EXTENSIONS.has(path.extname(name).toLowerCase());
 
 type FolderPath = Extract<ResolvedPath, { kind: "folder" }>;
 
@@ -103,7 +126,7 @@ function resolveInFolder(user: AppUser, virtualPath: string): FolderPath {
 /** Resolves a path the user is about to create, change, or remove. */
 function resolveWritable(user: AppUser, virtualPath: string): FolderPath {
 	const resolved = resolveInFolder(user, virtualPath);
-	if (user.readOnly || resolved.folder.readOnly) {
+	if (!canWriteFolder(resolved.folder, user)) {
 		throw new Forbidden("This folder is read-only");
 	}
 	if (resolved.isFolderRoot) {
@@ -151,16 +174,22 @@ async function assertFree(dst: string, src?: string) {
 	throw new Conflict("An item with that name already exists");
 }
 
-const execFileAsync = promisify(execFile);
-
-/** Disk usage of a file or tree in bytes, via `du` (streams the tree for us). */
-async function diskUsage(absPath: string): Promise<number> {
-	// du exits non-zero on unreadable entries but still prints the total.
-	const { stdout } = await execFileAsync("du", ["-sk", absPath]).catch(
-		(err: { stdout?: string }) => ({ stdout: err.stdout ?? "" }),
-	);
-	const kb = Number.parseInt(stdout, 10);
-	return Number.isFinite(kb) ? kb * 1024 : 0;
+/**
+ * The exact size in bytes of a file, or of all files in a tree. Unlike
+ * `du`, which counts whole disk blocks, a 10-byte file counts as 10 bytes.
+ * Walks one directory at a time and doesn't follow links. Unreadable
+ * entries count as 0.
+ */
+async function treeSize(absPath: string): Promise<number> {
+	const info = await lstat(absPath).catch(() => null);
+	if (!info?.isDirectory()) return info?.isFile() ? info.size : 0;
+	const dir = await opendir(absPath).catch(() => null);
+	if (!dir) return 0;
+	let total = 0;
+	for await (const dirent of dir) {
+		total += await treeSize(path.join(absPath, dirent.name));
+	}
+	return total;
 }
 
 const hasLimit = (folder: FolderConfig) => folder.storageLimit !== undefined;
@@ -181,10 +210,16 @@ async function trackUsage(folder: FolderConfig, delta: number) {
 	});
 }
 
-/** Measures every folder with a storageLimit and caches the result. Runs at startup. */
-export async function measureUsage() {
+/**
+ * Caches the usage of every folder with a storageLimit, summed from the search
+ * index so the disks aren't walked a second time. Runs after each full sync.
+ */
+async function measureUsage() {
 	for (const folder of getConfig().folders.filter(hasLimit)) {
-		await usage.setUsage(folder.name, await diskUsage(folder.path));
+		await usage.setUsage(
+			folder.name,
+			await searchIndex.folderSize(folder.name),
+		);
 	}
 }
 
@@ -214,11 +249,16 @@ function indexRow(
 
 /**
  * Brings the index for directory `rel` and everything below it in line with
- * the disk. A directory whose mtime matches its row is not re-read (its
- * children can't have changed), only descended into. Walks one directory at
- * a time, never holding the whole tree.
+ * the disk. `storedMtime` is the mtime in its row (undefined if it has none).
+ * A directory whose mtime matches is not re-read (its entries can't have
+ * changed), only descended into. Walks one directory at a time, never holding
+ * the whole tree, and writes only rows that changed.
  */
-async function syncIndexDir(folder: FolderConfig, rel: string): Promise<void> {
+async function syncIndexDir(
+	folder: FolderConfig,
+	rel: string,
+	storedMtime: number | undefined,
+): Promise<void> {
 	const abs = path.join(folder.path, `.${rel}`);
 	// The folder root may itself be a symlink; links below it are not followed.
 	const info = await (rel === "/" ? stat : lstat)(abs).catch(() => null);
@@ -228,18 +268,19 @@ async function syncIndexDir(folder: FolderConfig, rel: string): Promise<void> {
 		return;
 	}
 
-	const stored = await searchIndex.getEntry(folder.name, rel);
-	const known = await searchIndex.getChildren(folder.name, rel);
-	if (stored?.isDir && stored.mtimeMs === info.mtimeMs) {
-		for (const child of known) {
-			if (child.isDir) await syncIndexDir(folder, child.path);
+	if (storedMtime === info.mtimeMs) {
+		for (const child of await searchIndex.getChildren(folder.name, rel, true)) {
+			await syncIndexDir(folder, child.path, child.mtimeMs);
 		}
 		return;
 	}
 
-	const knownMtime = new Map(known.map((c) => [c.path, c.mtimeMs]));
-	const rows: searchIndex.IndexRow[] = [];
-	const subdirs: string[] = [];
+	const known = new Map(
+		(await searchIndex.getChildren(folder.name, rel)).map((c) => [c.path, c]),
+	);
+	const changed: searchIndex.IndexRow[] = [];
+	const subdirs: { path: string; storedMtime: number | undefined }[] = [];
+	const present = new Set<string>();
 	for await (const dirent of await opendir(abs)) {
 		if (rel === "/" && dirent.name.toLowerCase() === UPLOAD_STAGING_DIR) {
 			continue;
@@ -248,32 +289,87 @@ async function syncIndexDir(folder: FolderConfig, rel: string): Promise<void> {
 		// stat, like list(), so a link to a folder shows as a folder.
 		const childInfo = await stat(path.join(abs, dirent.name)).catch(() => null);
 		if (!childInfo) continue;
+		present.add(childRel);
 		const row = indexRow(folder, childRel, childInfo);
+		const old = known.get(childRel);
+		// A folder replaced by a file: drop what was indexed below it.
+		if (old?.isDir && !row.isDir) {
+			await searchIndex.removeTree(folder.name, childRel);
+		}
 		if (dirent.isDirectory()) {
 			// A directory's mtime marks it as synced, so it's only written by
 			// its own sync below. Until then keep the old value (-1 if new).
-			row.mtimeMs = knownMtime.get(childRel) ?? -1;
-			subdirs.push(childRel);
+			const storedMtime = old?.isDir ? old.mtimeMs : undefined;
+			row.mtimeMs = storedMtime ?? -1;
+			subdirs.push({ path: childRel, storedMtime });
 		}
-		rows.push(row);
-	}
-	const present = new Set(rows.map((r) => r.path));
-	for (const child of known) {
-		if (!present.has(child.path)) {
-			await searchIndex.removeTree(folder.name, child.path);
+		if (
+			!old ||
+			old.isDir !== row.isDir ||
+			old.size !== row.size ||
+			old.mtimeMs !== row.mtimeMs
+		) {
+			changed.push(row);
 		}
 	}
-	await searchIndex.upsertEntries(rows);
-	for (const subdir of subdirs) await syncIndexDir(folder, subdir);
+	const goneFiles: string[] = [];
+	for (const child of known.values()) {
+		if (present.has(child.path)) continue;
+		if (child.isDir) await searchIndex.removeTree(folder.name, child.path);
+		else goneFiles.push(child.path);
+	}
+	await searchIndex.removeEntries(folder.name, goneFiles);
+	await searchIndex.upsertEntries(changed);
+	for (const subdir of subdirs) {
+		await syncIndexDir(folder, subdir.path, subdir.storedMtime);
+	}
 	// Written last, so an interrupted sync re-reads this directory next time.
 	await searchIndex.upsertEntries([indexRow(folder, rel, info)]);
 }
 
-/** Syncs the search index with every configured folder. Runs at startup. */
-export async function indexFiles() {
-	const { folders } = getConfig();
-	await searchIndex.keepFolders(folders.map((f) => f.name));
-	for (const folder of folders) await syncIndexDir(folder, "/");
+// On globalThis because instrumentation (which starts syncs) and route
+// handlers (which report them) may each get their own copy of this module.
+const indexing = globalThis as {
+	fileCaptainIndexing?: Promise<void>;
+	/** Set once a sync has finished, i.e. the index is complete. */
+	fileCaptainIndexed?: boolean;
+};
+
+/**
+ * Syncs the search index with every configured folder, then re-measures
+ * storage usage from it. Runs at startup and every `indexIntervalMinutes`.
+ * A call while a sync is running joins it.
+ */
+export function indexFiles(): Promise<void> {
+	indexing.fileCaptainIndexing ??= (async () => {
+		const { folders } = getConfig();
+		await searchIndex.keepFolders(folders.map((f) => f.name));
+		for (const folder of folders) {
+			const root = await searchIndex.getEntry(folder.name, "/");
+			await syncIndexDir(folder, "/", root?.mtimeMs);
+		}
+		indexing.fileCaptainIndexed = true;
+		await measureUsage();
+	})().finally(() => {
+		indexing.fileCaptainIndexing = undefined;
+	});
+	return indexing.fileCaptainIndexing;
+}
+
+export type Status = {
+	/**
+	 * True while the first sync since startup runs; search may be incomplete.
+	 * Later periodic syncs only catch up on outside changes, so they don't count.
+	 */
+	indexing: boolean;
+};
+
+export function status(_user: AppUser): Status {
+	return {
+		indexing:
+			indexing.fileCaptainIndexing !== undefined &&
+			!indexing.fileCaptainIndexed,
+	};
 }
 
 /**
@@ -295,7 +391,7 @@ function indexAdded(target: FolderPath) {
 		if (info.isDirectory()) {
 			// Drop any stale row first so the walk doesn't skip the directory.
 			await searchIndex.removeTree(target.folder.name, rel);
-			await syncIndexDir(target.folder, rel);
+			await syncIndexDir(target.folder, rel, undefined);
 		} else {
 			await searchIndex.upsertEntries([indexRow(target.folder, rel, info)]);
 		}
@@ -350,13 +446,27 @@ export async function list(
 		const entries = await Promise.all(
 			folders.map(async (folder) => {
 				const info = await stat(folder.path).catch(() => null);
-				return {
+				const entry = {
 					name: folder.name,
 					type: "dir" as const,
-					size: hasLimit(folder) ? await usage.getUsage(folder.name) : 0,
+					size: 0,
 					mtime: (info?.mtime ?? new Date(0)).toISOString(),
 					thumbnail: false,
-					limit: folder.storageLimit,
+				};
+				if (hasLimit(folder)) {
+					return {
+						...entry,
+						size: await usage.getUsage(folder.name),
+						limit: folder.storageLimit,
+					};
+				}
+				const disk = await statfs(folder.path).catch(() => null);
+				if (!disk) return entry;
+				return {
+					...entry,
+					size: (disk.blocks - disk.bfree) * disk.bsize,
+					limit: disk.blocks * disk.bsize,
+					disk: true,
 				};
 			}),
 		);
@@ -391,14 +501,13 @@ export async function list(
 				type: isDir ? "dir" : "file",
 				size: isDir ? 0 : info.size,
 				mtime: info.mtime.toISOString(),
-				thumbnail:
-					!isDir && THUMBNAIL_EXTENSIONS.has(path.extname(name).toLowerCase()),
+				thumbnail: !isDir && hasThumbnail(name),
 			};
 		}),
 	);
 	return {
 		entries: entries.filter((e): e is Entry => e !== null),
-		writable: !user.readOnly && !resolved.folder.readOnly,
+		writable: canWriteFolder(resolved.folder, user),
 	};
 }
 
@@ -426,9 +535,7 @@ export async function search(
 		type: row.isDir ? "dir" : "file",
 		size: row.size,
 		mtime: new Date(row.mtimeMs).toISOString(),
-		thumbnail:
-			!row.isDir &&
-			THUMBNAIL_EXTENSIONS.has(path.extname(row.name).toLowerCase()),
+		thumbnail: !row.isDir && hasThumbnail(row.name),
 	}));
 }
 
@@ -482,6 +589,82 @@ export async function openDownload(
 	};
 }
 
+export type ZipDownload = { name: string; stream: ReadableStream<Uint8Array> };
+
+/**
+ * Streams entries of folder `dir` as a zip, folders recursively. Adds one
+ * file at a time and walks one directory at a time, so neither the files nor
+ * the tree are held in memory. Like list(), the selected entries themselves
+ * may be symlinks; links further down are skipped.
+ */
+export async function openZip(
+	user: AppUser,
+	dir: string,
+	names: string[],
+): Promise<ZipDownload> {
+	const parent = resolveInFolder(user, dir);
+	// Checked up front so a bad request gets an error, not a broken zip.
+	const items: { name: string; absPath: string; info: Stats }[] = [];
+	for (const name of new Set(names)) {
+		if (!isValidName(name)) throw new BadRequest("Invalid name");
+		const { absPath } = resolveInFolder(user, `${parent.virtualPath}/${name}`);
+		const info = await stat(absPath).catch((err) => {
+			throw toAppError(err);
+		});
+		items.push({ name, absPath, info });
+	}
+
+	// Stored, not compressed: photos and videos are compressed already, and
+	// deflating gigabytes would cost a lot of CPU for little gain.
+	const archive = new ZipArchive({ store: true });
+	// The client went away: stop walking and release the open file.
+	const closed = new AbortController();
+	let reading: ReadStream | undefined;
+	archive.on("close", () => {
+		closed.abort();
+		reading?.destroy();
+	});
+	// Waits until the archive has taken in the last entry (and the client
+	// has read enough of it).
+	const appended = () => once(archive, "entry", { signal: closed.signal });
+
+	async function add(absPath: string, name: string, info: Stats) {
+		if (info.isDirectory()) {
+			archive.append(Buffer.alloc(0), {
+				name,
+				type: "directory",
+				date: info.mtime,
+			});
+			await appended();
+			for await (const dirent of await opendir(absPath)) {
+				const child = path.join(absPath, dirent.name);
+				const childInfo = await lstat(child).catch(() => null);
+				if (!childInfo || childInfo.isSymbolicLink()) continue;
+				await add(child, `${name}/${dirent.name}`, childInfo);
+			}
+		} else if (info.isFile()) {
+			reading = createReadStream(absPath);
+			archive.append(reading, { name, date: info.mtime });
+			await appended();
+		}
+		// Sockets, FIFOs and devices are skipped.
+	}
+
+	(async () => {
+		for (const item of items) await add(item.absPath, item.name, item.info);
+		await archive.finalize();
+	})().catch((err) => {
+		if (!closed.signal.aborted) console.error("Zip download failed", err);
+		archive.destroy(err);
+	});
+
+	const folderName = path.posix.basename(parent.virtualPath);
+	return {
+		name: `${folderName}.zip`,
+		stream: Readable.toWeb(archive) as ReadableStream<Uint8Array>,
+	};
+}
+
 export function mkdir(user: AppUser, virtualPath: string) {
 	return audited(user, "mkdir", virtualPath, undefined, async () => {
 		const target = resolveWritable(user, virtualPath);
@@ -524,7 +707,7 @@ export function move(user: AppUser, srcPath: string, dstPath: string) {
 		const crossFolder = src.folder.name !== dst.folder.name;
 		const bytes =
 			crossFolder && (hasLimit(src.folder) || hasLimit(dst.folder))
-				? await diskUsage(src.absPath)
+				? await treeSize(src.absPath)
 				: 0;
 		await assertSpace(dst.folder, bytes);
 		try {
@@ -559,7 +742,7 @@ export function copy(user: AppUser, srcPath: string, dstPath: string) {
 		}
 		await lstat(src.absPath);
 		await assertFree(dst.absPath);
-		const bytes = hasLimit(dst.folder) ? await diskUsage(src.absPath) : 0;
+		const bytes = hasLimit(dst.folder) ? await treeSize(src.absPath) : 0;
 		await assertSpace(dst.folder, bytes);
 		await copyTree(src.absPath, dst.absPath);
 		await trackUsage(dst.folder, bytes);
@@ -571,7 +754,7 @@ export function remove(user: AppUser, virtualPath: string) {
 	return audited(user, "delete", virtualPath, undefined, async () => {
 		const target = resolveWritable(user, virtualPath);
 		await lstat(target.absPath);
-		const bytes = hasLimit(target.folder) ? await diskUsage(target.absPath) : 0;
+		const bytes = hasLimit(target.folder) ? await treeSize(target.absPath) : 0;
 		await rm(target.absPath, { recursive: true });
 		await trackUsage(target.folder, -bytes);
 		await updateIndex("delete", () =>
@@ -588,7 +771,7 @@ export async function getThumbnail(
 	virtualPath: string,
 ): Promise<Thumbnail> {
 	const resolved = resolveInFolder(user, virtualPath);
-	if (!THUMBNAIL_EXTENSIONS.has(path.extname(resolved.absPath).toLowerCase())) {
+	if (!hasThumbnail(resolved.absPath)) {
 		throw new NotFound();
 	}
 	const info = await stat(resolved.absPath).catch(() => null);
@@ -668,7 +851,7 @@ export function finalizeUpload(
 			if (!isValidName(path.basename(target.absPath)))
 				throw new BadRequest("Invalid name");
 			// Re-checked: other uploads may have finished meanwhile.
-			const bytes = hasLimit(target.folder) ? await diskUsage(stagedPath) : 0;
+			const bytes = hasLimit(target.folder) ? await treeSize(stagedPath) : 0;
 			await assertSpace(target.folder, bytes);
 			try {
 				// link() fails with EEXIST instead of replacing, unlike rename().

@@ -30,10 +30,32 @@ export type ResolvedPath =
 			isFolderRoot: boolean;
 	  };
 
-export function canAccessFolder(folder: FolderConfig, username: string) {
-	if (folder.users === "all") return true;
+function isListed(list: FolderConfig["users"], username: string) {
+	if (list === "all") return true;
 	const key = username.toLowerCase();
-	return folder.users.some((u) => u.toLowerCase() === key);
+	return list.some((u) => u.toLowerCase() === key);
+}
+
+export function canAccessFolder(folder: FolderConfig, username: string) {
+	return (
+		isListed(folder.users, username) || isListed(folder.readOnlyUsers, username)
+	);
+}
+
+/**
+ * Writes need write access everywhere: the user and folder aren't readOnly,
+ * and the user is in `users` but not `readOnlyUsers` (most restrictive wins).
+ */
+export function canWriteFolder(
+	folder: FolderConfig,
+	user: { username: string; readOnly: boolean },
+) {
+	return (
+		!user.readOnly &&
+		!folder.readOnly &&
+		isListed(folder.users, user.username) &&
+		!isListed(folder.readOnlyUsers, user.username)
+	);
 }
 
 export function accessibleFolders(folders: FolderConfig[], username: string) {

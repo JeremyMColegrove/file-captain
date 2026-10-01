@@ -12,6 +12,7 @@ In scope:
 - Multiple users, each confined to the folders configured for them (shared or per-user)
 - Browse (list), download, upload, mkdir, rename, move, copy, delete
 - Image thumbnails
+- Inline preview of browser-native images, video/audio, and plain text (first 1 MB). No rendering, conversion, or syntax highlighting.
 - Chunked, resumable uploads
 - An append-only audit log of every mutating action
 - All configuration from config.yaml
@@ -88,7 +89,7 @@ folders:
 Additional rules:
 - Usernames and folder names are unique. Every username listed under a folder must exist in `users`.
 - If a folder's directory does not exist, create it at startup.
-- `storageLimit`: each limited folder's usage is measured with `du -sk` at startup (in the background) and cached in the `folder_usage` table. file-service adjusts it after upload, copy, move and delete, and rejects writes that would exceed the limit. Only per-folder totals are stored.
+- `storageLimit`: each limited folder's usage is measured in exact bytes (by walking the tree, in the background) at startup and cached in the `folder_usage` table. file-service adjusts it after upload, copy, move and delete, and rejects writes that would exceed the limit. Only per-folder totals are stored.
 - A write is allowed only if neither the user nor the folder is `readOnly`. Read-only users/folders allow list, download, and thumbnails only. Enforce this in `file-service`, not in the UI alone.
 
 ## Uploads
@@ -97,6 +98,13 @@ Additional rules:
 - When an upload finishes, the completion handler calls `fileService.finalizeUpload(user, stagedPath, targetVirtualPath)`. That method validates the target, and writes an audit entry.
 - On a name conflict, reject the upload. Never silently overwrite. The client may retry with a new name.
 - Stale incomplete uploads older than 24h are cleaned up on startup and on an hourly interval.
+
+## Previews
+
+- Opening a file shows it full-screen. Files that can't be previewed show their icon, name and a Download button.
+- `/api/files/download?inline=1` serves a file inline only if `previewOf()` in `lib/file-types.ts` allowlists it; everything else is still an attachment. Never allowlist types that can carry script (SVG, HTML, PDF). Text, code and data are always `text/plain`.
+- Inline responses carry `X-Content-Type-Options: nosniff` and `Content-Security-Policy: sandbox`.
+- The browser does all decoding. No server-side conversion, renditions, or transcoding; unplayable files fall back to Download.
 
 ## Thumbnails
 

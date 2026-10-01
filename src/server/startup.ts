@@ -1,6 +1,6 @@
 import { syncUsers } from "./better-auth/sync-users";
 import { configPath, getConfig } from "./config";
-import { indexFiles, initStorage, measureUsage } from "./file-service";
+import { indexFiles, initStorage } from "./file-service";
 import { cleanStaleUploads } from "./uploads";
 
 /** Runs once when the server starts. Exits the process if anything is wrong. */
@@ -10,10 +10,9 @@ export async function startup() {
 		await initStorage();
 		await syncUsers();
 		await cleanStaleUploads();
-		// In the background: big folders take a while, and the last measured
-		// value in the database is used until this finishes.
-		measureUsage().catch((err) => console.error("Measuring usage failed", err));
-		// Also in the background; search covers what's indexed so far.
+		// In the background: big folders take a while. Search covers what's
+		// indexed so far, and storage limits use the last measured usage until
+		// the sync finishes and re-measures it.
 		indexFiles().catch((err) => console.error("Indexing files failed", err));
 		setInterval(
 			() => {
@@ -21,6 +20,17 @@ export async function startup() {
 			},
 			60 * 60 * 1000,
 		).unref();
+		const { indexIntervalMinutes } = config.server;
+		if (indexIntervalMinutes > 0) {
+			setInterval(
+				() => {
+					indexFiles().catch((err) =>
+						console.error("Indexing files failed", err),
+					);
+				},
+				indexIntervalMinutes * 60 * 1000,
+			).unref();
+		}
 		console.log(
 			`Loaded ${configPath()}: ${config.users.length} user(s), ${config.folders.length} folder(s)`,
 		);

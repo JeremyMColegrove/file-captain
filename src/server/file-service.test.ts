@@ -1,3 +1,4 @@
+import { execFile } from "node:child_process";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import {
 	mkdir,
@@ -5,10 +6,12 @@ import {
 	readFile,
 	rm,
 	stat,
+	symlink,
 	writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { promisify } from "node:util";
 import sharp from "sharp";
 import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -29,6 +32,8 @@ vi.mock("./usage", () => ({
 type IndexRow = import("./search-index").IndexRow;
 const index = vi.hoisted(() => ({
 	rows: new Map<string, IndexRow>(),
+	/** Paths passed to upsertEntries, to check unchanged rows aren't rewritten. */
+	upserted: [] as string[],
 }));
 vi.mock("./search-index", () => {
 	const key = (folder: string, p: string) => `${folder}\0${p}`;
@@ -37,12 +42,19 @@ vi.mock("./search-index", () => {
 	return {
 		getEntry: async (folder: string, p: string) =>
 			index.rows.get(key(folder, p)),
-		getChildren: async (folder: string, parent: string) =>
+		getChildren: async (folder: string, parent: string, dirsOnly = false) =>
 			[...index.rows.values()].filter(
-				(r) => r.folder === folder && r.parent === parent,
+				(r) =>
+					r.folder === folder && r.parent === parent && (!dirsOnly || r.isDir),
 			),
 		upsertEntries: async (rows: IndexRow[]) => {
-			for (const r of rows) index.rows.set(key(r.folder, r.path), r);
+			for (const r of rows) {
+				index.rows.set(key(r.folder, r.path), r);
+				index.upserted.push(`${r.folder}${r.path}`);
+			}
+		},
+		removeEntries: async (folder: string, paths: string[]) => {
+			for (const p of paths) index.rows.delete(key(folder, p));
 		},
 		removeTree: async (folder: string, p: string) => {
 			for (const [k, r] of index.rows) {
@@ -68,6 +80,10 @@ vi.mock("./search-index", () => {
 				});
 			}
 		},
+		folderSize: async (folder: string) =>
+			[...index.rows.values()]
+				.filter((r) => r.folder === folder && !r.isDir)
+				.reduce((sum, r) => sum + r.size, 0),
 		keepFolders: async (folders: string[]) => {
 			for (const [k, r] of index.rows) {
 				if (!folders.includes(r.folder)) index.rows.delete(k);
@@ -93,6 +109,7 @@ const dirs = {
 	alice: path.join(tmp, "alice"),
 	archive: path.join(tmp, "archive"),
 	quota: path.join(tmp, "quota"),
+	view: path.join(tmp, "view"),
 };
 const auditLog = path.join(tmp, "data", "audit.jsonl");
 writeFileSync(
@@ -103,10 +120,10 @@ server:
   auditLog: ${auditLog}
   maxUploadSize: 1GB
 users:
-  - username: alice
-    password: pw
-  - username: guest
-    password: pw
+  - username: alice@example.com
+    password: test-password
+  - username: guest@example.com
+    password: test-password
     readOnly: true
 folders:
   - name: shared
@@ -114,7 +131,7 @@ folders:
     users: all
   - name: alice
     path: ${dirs.alice}
-    users: [alice]
+    users: [alice@example.com]
   - name: archive
     path: ${dirs.archive}
     users: all
@@ -123,6 +140,9 @@ folders:
     path: ${dirs.quota}
     users: all
     storageLimit: 256KB
+  - name: view
+    path: ${dirs.view}
+    readOnlyUsers: [alice@example.com]
 `,
 );
 process.env.CONFIG_PATH = path.join(tmp, "config.yaml");
@@ -130,8 +150,18 @@ process.env.CONFIG_PATH = path.join(tmp, "config.yaml");
 const fs = await import("./file-service");
 const { BadRequest, Conflict, Forbidden, NotFound } = await import("./errors");
 
-const alice = { username: "alice", readOnly: false, ip: "203.0.113.5" };
-const guest = { username: "guest", readOnly: true, ip: "203.0.113.6" };
+const alice = {
+	username: "alice@example.com",
+	readOnly: false,
+	ip: "203.0.113.5",
+};
+const guest = {
+	username: "guest@example.com",
+	readOnly: true,
+	ip: "203.0.113.6",
+};
+
+const execFileAsync = promisify(execFile);
 
 async function auditEntries() {
 	const text = await readFile(auditLog, "utf8").catch(() => "");
@@ -176,7 +206,7 @@ describe("initStorage", () => {
 describe("list", () => {
 	it("lists accessible folders at the root", async () => {
 		const names = (await fs.list(alice, "/")).entries.map((e) => e.name).sort();
-		expect(names).toEqual(["alice", "archive", "quota", "shared"]);
+		expect(names).toEqual(["alice", "archive", "quota", "shared", "view"]);
 		const guestNames = (await fs.list(guest, "/")).entries
 			.map((e) => e.name)
 			.sort();
@@ -188,6 +218,7 @@ describe("list", () => {
 		expect(writable).toBe(true);
 		expect((await fs.list(guest, "/shared")).writable).toBe(false);
 		expect((await fs.list(alice, "/archive")).writable).toBe(false);
+		expect((await fs.list(alice, "/view")).writable).toBe(false);
 		const byName = Object.fromEntries(entries.map((e) => [e.name, e]));
 		expect(byName["a.txt"]).toMatchObject({
 			type: "file",
@@ -246,6 +277,92 @@ describe("openDownload", () => {
 	});
 });
 
+describe("openZip", () => {
+	/** Saves the zip and lists it with the system unzip: "name size" per entry. */
+	async function unzipList(stream: ReadableStream<Uint8Array>) {
+		const file = path.join(tmp, "out.zip");
+		await writeFile(
+			file,
+			Buffer.from(await new Response(stream).arrayBuffer()),
+		);
+		const { stdout } = await execFileAsync("unzip", ["-Z", "-l", file]);
+		const { stdout: content } = await execFileAsync("unzip", [
+			"-p",
+			file,
+			"docs/deep/b.txt",
+		]).catch(() => ({ stdout: "" }));
+		await rm(file);
+		const entries = stdout
+			.split("\n")
+			.filter((line) => /^[-d]/.test(line))
+			.map((line) => {
+				const cols = line.trim().split(/\s+/);
+				return `${cols.at(-1)} ${cols[3]}`;
+			})
+			.sort();
+		return { entries, content };
+	}
+
+	it("zips files and folders recursively, named after the folder", async () => {
+		const zip = await fs.openZip(alice, "/shared", ["a.txt", "docs"]);
+		expect(zip.name).toBe("shared.zip");
+		const { entries, content } = await unzipList(zip.stream);
+		expect(entries).toEqual([
+			"a.txt 11",
+			"docs/ 0",
+			"docs/deep/ 0",
+			"docs/deep/b.txt 1",
+		]);
+		expect(content).toBe("b");
+	});
+
+	it("skips symlinks below the selection", async () => {
+		await symlink(
+			path.join(dirs.alice),
+			path.join(dirs.shared, "docs", "link"),
+		);
+		const { entries } = await unzipList(
+			(await fs.openZip(alice, "/shared", ["docs"])).stream,
+		);
+		expect(entries).not.toContainEqual(expect.stringContaining("link"));
+	});
+
+	it("stops cleanly when the client cancels", async () => {
+		await writeFile(
+			path.join(dirs.shared, "big.bin"),
+			Buffer.alloc(4 * 1024 ** 2),
+		);
+		const errors = vi.spyOn(console, "error");
+		const reader = (
+			await fs.openZip(alice, "/shared", ["big.bin", "docs"])
+		).stream.getReader();
+		await reader.read();
+		await reader.cancel();
+		await new Promise((resolve) => setTimeout(resolve, 50));
+		expect(errors).not.toHaveBeenCalled();
+		errors.mockRestore();
+	});
+
+	it("is allowed for read-only users", async () => {
+		const zip = await fs.openZip(guest, "/archive", ["old.txt"]);
+		expect(zip.name).toBe("archive.zip");
+		expect((await unzipList(zip.stream)).entries).toEqual(["old.txt 3"]);
+	});
+
+	it("rejects bad names, missing entries, the root and hidden folders", async () => {
+		await expect(fs.openZip(alice, "/shared", ["../alice"])).rejects.toThrow(
+			BadRequest,
+		);
+		await expect(fs.openZip(alice, "/shared", ["nope.txt"])).rejects.toThrow(
+			NotFound,
+		);
+		await expect(fs.openZip(alice, "/", ["shared"])).rejects.toThrow(
+			BadRequest,
+		);
+		await expect(fs.openZip(guest, "/alice", ["x"])).rejects.toThrow(NotFound);
+	});
+});
+
 describe("parseRange", () => {
 	it("handles the common forms", () => {
 		expect(fs.parseRange("bytes=0-4", 10)).toEqual({ start: 0, end: 4 });
@@ -278,7 +395,7 @@ describe("mkdir", () => {
 		);
 		expect(await auditEntries()).toEqual([
 			expect.objectContaining({
-				user: "alice",
+				user: "alice@example.com",
 				action: "mkdir",
 				src: "/shared/new",
 				result: "ok",
@@ -301,6 +418,7 @@ describe("mkdir", () => {
 	it("refuses read-only users and read-only folders", async () => {
 		await expect(fs.mkdir(guest, "/shared/new")).rejects.toThrow(Forbidden);
 		await expect(fs.mkdir(alice, "/archive/new")).rejects.toThrow(Forbidden);
+		await expect(fs.mkdir(alice, "/view/new")).rejects.toThrow(Forbidden);
 	});
 
 	it("refuses top-level folders and the root", async () => {
@@ -400,7 +518,7 @@ describe("move", () => {
 		await expect(
 			fs.move(guest, "/shared/a.txt", "/alice/a.txt"),
 		).rejects.toThrow(Forbidden);
-		const bob = { ...alice, username: "bob" };
+		const bob = { ...alice, username: "bob@example.com" };
 		await expect(fs.move(bob, "/shared/a.txt", "/alice/a.txt")).rejects.toThrow(
 			NotFound,
 		);
@@ -533,6 +651,23 @@ describe("getThumbnail", () => {
 		expect(after.etag).not.toBe(before.etag);
 	});
 
+	it("lists no thumbnails and serves none when thumbnailConcurrency is 0", async () => {
+		const { getConfig } = await import("./config");
+		const server = getConfig().server;
+		const original = server.thumbnailConcurrency;
+		server.thumbnailConcurrency = 0;
+		try {
+			const { entries } = await fs.list(alice, "/shared");
+			expect(entries.find((e) => e.name === "real.png")?.thumbnail).toBe(false);
+			await expect(fs.getThumbnail(alice, "/shared/real.png")).rejects.toThrow(
+				NotFound,
+			);
+			expect(await readdir(thumbDir())).toEqual([]);
+		} finally {
+			server.thumbnailConcurrency = original;
+		}
+	});
+
 	it("returns NotFound for non-images, broken images and folders", async () => {
 		await expect(fs.getThumbnail(alice, "/shared/a.txt")).rejects.toThrow(
 			NotFound,
@@ -592,7 +727,7 @@ describe("uploads", () => {
 		await expect(stat(staged())).rejects.toThrow();
 		const [entry] = await auditEntries();
 		expect(entry).toMatchObject({
-			user: "alice",
+			user: "alice@example.com",
 			action: "upload",
 			src: "/shared/docs/new.txt",
 			result: "ok",
@@ -623,12 +758,19 @@ describe("storage limits", () => {
 
 	beforeEach(async () => {
 		await writeFile(path.join(dirs.quota, "a.bin"), Buffer.alloc(40 * KB));
-		await fs.measureUsage();
+		await fs.indexFiles();
 	});
 
-	it("measures only folders with a limit", () => {
+	it("measures usage from the index after a sync, only for limited folders", () => {
 		expect([...usageMap.keys()]).toEqual(["quota"]);
-		expect(usageMap.get("quota")).toBeGreaterThanOrEqual(40 * KB);
+		expect(usageMap.get("quota")).toBe(40 * KB);
+	});
+
+	it("measures exact bytes, not disk blocks", async () => {
+		await mkdir(path.join(dirs.quota, "sub"));
+		await writeFile(path.join(dirs.quota, "sub", "tiny.txt"), "hello");
+		await fs.indexFiles();
+		expect(usageMap.get("quota")).toBe(40 * KB + 5);
 	});
 
 	it("reports usage and limit in the root listing", async () => {
@@ -638,7 +780,16 @@ describe("storage limits", () => {
 			size: usageMap.get("quota"),
 			limit: 256 * KB,
 		});
-		expect(byName.shared?.limit).toBeUndefined();
+		expect(byName.quota?.disk).toBeUndefined();
+	});
+
+	it("reports disk usage for folders without a limit", async () => {
+		const { entries } = await fs.list(alice, "/");
+		const shared = entries.find((e) => e.name === "shared");
+		expect(shared?.disk).toBe(true);
+		expect(shared?.limit).toBeGreaterThan(0);
+		expect(shared?.size).toBeGreaterThan(0);
+		expect(shared?.size).toBeLessThanOrEqual(shared?.limit ?? 0);
 	});
 
 	it("rejects uploads that would exceed the limit", async () => {
@@ -653,7 +804,7 @@ describe("storage limits", () => {
 		const staged = path.join(tmp, "data", "staged.bin");
 		await writeFile(staged, Buffer.alloc(40 * KB));
 		await fs.finalizeUpload(alice, staged, "/quota/b.bin");
-		expect(usageMap.get("quota")).toBeGreaterThanOrEqual(before + 40 * KB);
+		expect(usageMap.get("quota")).toBe(before + 40 * KB);
 	});
 
 	it("tracks copies, moves and deletes", async () => {
@@ -662,13 +813,13 @@ describe("storage limits", () => {
 
 		await fs.copy(alice, "/shared/c.bin", "/quota/c.bin");
 		const afterCopy = usageMap.get("quota") ?? 0;
-		expect(afterCopy).toBeGreaterThanOrEqual(start + 40 * KB);
+		expect(afterCopy).toBe(start + 40 * KB);
 
 		await fs.move(alice, "/quota/c.bin", "/shared/c2.bin");
 		expect(usageMap.get("quota")).toBe(start);
 
 		await fs.remove(alice, "/quota/a.bin");
-		expect(usageMap.get("quota")).toBeLessThan(start);
+		expect(usageMap.get("quota")).toBe(start - 40 * KB);
 	});
 
 	it("rejects copies and moves that would exceed the limit", async () => {
@@ -718,6 +869,28 @@ describe("search index", () => {
 		expect(index.rows.get("shared\0/docs/deep/b.txt")?.size).toBe(1);
 	});
 
+	it("writes only rows that changed", async () => {
+		index.upserted = [];
+		await fs.indexFiles();
+		expect(index.upserted).toEqual([]);
+
+		await writeFile(path.join(dirs.shared, "docs", "new.txt"), "n");
+		await fs.indexFiles();
+		// The new file, then /docs itself, marked synced.
+		expect(index.upserted).toEqual(["shared/docs/new.txt", "shared/docs"]);
+	});
+
+	it("drops what was below a folder that became a file", async () => {
+		await rm(path.join(dirs.shared, "docs"), { recursive: true });
+		await writeFile(path.join(dirs.shared, "docs"), "now a file");
+		await fs.indexFiles();
+		expect(paths()).toEqual(["/", "/a.txt", "/docs", "/pic.JPG"]);
+		expect(index.rows.get("shared\0/docs")).toMatchObject({
+			isDir: false,
+			size: 10,
+		});
+	});
+
 	it("drops folders that are no longer configured", async () => {
 		index.rows.set("gone\0/", {
 			folder: "gone",
@@ -761,6 +934,22 @@ describe("search index", () => {
 			"/moved/docs2 /moved/docs2/deep deep",
 			"/moved/docs2/deep /moved/docs2/deep/b.txt b.txt",
 		]);
+	});
+
+	it("reports the first sync, and joins a running one instead of starting another", async () => {
+		const state = globalThis as { fileCaptainIndexed?: boolean };
+		state.fileCaptainIndexed = undefined; // as if just started
+		expect(fs.status(alice).indexing).toBe(false);
+		const first = fs.indexFiles();
+		expect(fs.indexFiles()).toBe(first);
+		expect(fs.status(alice).indexing).toBe(true);
+		await first;
+		expect(fs.status(alice).indexing).toBe(false);
+
+		// Later syncs catch up on outside changes; the index is complete already.
+		const later = fs.indexFiles();
+		expect(fs.status(alice).indexing).toBe(false);
+		await later;
 	});
 
 	it("searches only the user's folders and returns virtual paths", async () => {

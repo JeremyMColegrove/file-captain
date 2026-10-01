@@ -41,6 +41,14 @@ export const fileIndex = pgTable(
 	(t) => [
 		primaryKey({ columns: [t.folder, t.path] }),
 		index("file_index_parent_idx").on(t.folder, t.parent),
+		// Subtree lookups (`path LIKE '/a/%'`) for move and delete. The primary
+		// key can't serve LIKE unless the database collation is "C".
+		index("file_index_path_prefix_idx").on(
+			t.folder,
+			t.path.op("text_pattern_ops"),
+		),
+		// Substring search on names (`name ILIKE '%term%'`). Needs pg_trgm.
+		index("file_index_name_trgm_idx").using("gin", t.name.op("gin_trgm_ops")),
 	],
 );
 

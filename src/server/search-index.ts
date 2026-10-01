@@ -5,6 +5,7 @@ import {
 	eq,
 	ilike,
 	inArray,
+	like,
 	ne,
 	notInArray,
 	or,
@@ -21,15 +22,14 @@ import { fileIndex } from "./db/schema";
 
 export type IndexRow = typeof fileIndex.$inferSelect;
 
+const escapeLike = (s: string) => s.replace(/[\\%_]/g, "\\$&");
+
 /** Rows at `p` and everything below it. */
 function inTree(folder: string, p: string) {
 	return and(
 		eq(fileIndex.folder, folder),
-		or(
-			eq(fileIndex.path, p),
-			// left() instead of LIKE, so names containing % or _ need no escaping.
-			eq(sql`left(${fileIndex.path}, ${p.length + 1})`, `${p}/`),
-		),
+		// A LIKE prefix, so file_index_path_prefix_idx can serve it.
+		or(eq(fileIndex.path, p), like(fileIndex.path, `${escapeLike(p)}/%`)),
 	);
 }
 
@@ -41,11 +41,29 @@ export async function getEntry(folder: string, p: string) {
 	return row;
 }
 
-export function getChildren(folder: string, parent: string) {
+export type ChildRow = Pick<IndexRow, "path" | "isDir" | "size" | "mtimeMs">;
+
+/** The direct children of `parent`, or only its subdirectories if `dirsOnly`. */
+export function getChildren(
+	folder: string,
+	parent: string,
+	dirsOnly = false,
+): Promise<ChildRow[]> {
 	return db
-		.select()
+		.select({
+			path: fileIndex.path,
+			isDir: fileIndex.isDir,
+			size: fileIndex.size,
+			mtimeMs: fileIndex.mtimeMs,
+		})
 		.from(fileIndex)
-		.where(and(eq(fileIndex.folder, folder), eq(fileIndex.parent, parent)));
+		.where(
+			and(
+				eq(fileIndex.folder, folder),
+				eq(fileIndex.parent, parent),
+				dirsOnly ? eq(fileIndex.isDir, true) : undefined,
+			),
+		);
 }
 
 export async function upsertEntries(rows: IndexRow[]) {
@@ -69,6 +87,20 @@ export async function upsertEntries(rows: IndexRow[]) {
 
 export async function removeTree(folder: string, p: string) {
 	await db.delete(fileIndex).where(inTree(folder, p));
+}
+
+/** Removes the rows at exactly `paths` (files; use removeTree for folders). */
+export async function removeEntries(folder: string, paths: string[]) {
+	for (let i = 0; i < paths.length; i += 1000) {
+		await db
+			.delete(fileIndex)
+			.where(
+				and(
+					eq(fileIndex.folder, folder),
+					inArray(fileIndex.path, paths.slice(i, i + 1000)),
+				),
+			);
+	}
 }
 
 /** Re-keys `src` and everything below it to `dst`, without touching the disk. */
@@ -96,6 +128,16 @@ export async function moveTree(
 	});
 }
 
+/** Total bytes of the files indexed in `folder`. */
+export async function folderSize(folder: string): Promise<number> {
+	const [row] = await db
+		.select({ bytes: sql<string>`coalesce(sum(${fileIndex.size}), 0)` })
+		.from(fileIndex)
+		.where(and(eq(fileIndex.folder, folder), eq(fileIndex.isDir, false)));
+	// Postgres returns sum(bigint) as numeric, which arrives as a string.
+	return Number(row?.bytes ?? 0);
+}
+
 /** Drops rows of folders that are no longer in config.yaml. */
 export async function keepFolders(folders: string[]) {
 	await db
@@ -114,9 +156,7 @@ export function search(folders: string[], query: string, limit: number) {
 			and(
 				inArray(fileIndex.folder, folders),
 				ne(fileIndex.path, "/"),
-				...words.map((w) =>
-					ilike(fileIndex.name, `%${w.replace(/[\\%_]/g, "\\$&")}%`),
-				),
+				...words.map((w) => ilike(fileIndex.name, `%${escapeLike(w)}%`)),
 			),
 		)
 		.orderBy(desc(fileIndex.isDir), asc(fileIndex.name))

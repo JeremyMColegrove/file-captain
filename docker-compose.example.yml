@@ -32,5 +32,16 @@ services:
       PGID: 1000
     ports:
       - "3000:3000"
+    volumes:
+      # config.yaml is read from /config/config.yaml (override with CONFIG_PATH).
+      - ./config.yaml:/config/config.yaml:ro
+      # Thumbnail cache and audit log (server.cacheDir / server.auditLog).
+      - ./data:/data
+      # One line per folder in config.yaml: <host path>:<container path>.
+      # The container path (right side) is what goes in that folder's `path:`.
+      # PUID:PGID must be able to write the host directories.
+      - /mnt/media/shared/global:/mnt/media/shared/global
+      - /mnt/media/shared/jeremy:/mnt/media/shared/jeremy
+      - /mnt/media/shared/family:/mnt/media/shared/family
 volumes:
   app-data:

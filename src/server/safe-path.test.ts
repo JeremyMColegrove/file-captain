@@ -3,13 +3,32 @@ import { describe, expect, it } from "vitest";
 
 import type { FolderConfig } from "./config";
 import { BadRequest, NotFound } from "./errors";
-import { isValidName, resolveVirtualPath } from "./safe-path";
+import {
+	canAccessFolder,
+	canWriteFolder,
+	isValidName,
+	resolveVirtualPath,
+} from "./safe-path";
+
+const folder = (
+	name: string,
+	users: FolderConfig["users"],
+	extra: Partial<FolderConfig> = {},
+): FolderConfig => ({
+	name,
+	path: `/srv/${name}`,
+	users,
+	readOnlyUsers: [],
+	readOnly: false,
+	...extra,
+});
 
 const folders: FolderConfig[] = [
-	{ name: "shared", path: "/srv/shared", users: "all", readOnly: false },
-	{ name: "alice", path: "/srv/alice", users: ["alice"], readOnly: false },
+	folder("shared", "all"),
+	folder("alice", ["alice"]),
 	// A sibling whose path shares a prefix with /srv/alice.
-	{ name: "alice2", path: "/srv/alice2", users: ["bob"], readOnly: false },
+	folder("alice2", ["bob"]),
+	folder("view", [], { readOnlyUsers: ["alice"] }),
 ];
 
 const resolve = (p: string, user = "alice") =>
@@ -120,6 +139,55 @@ describe("resolveVirtualPath", () => {
 		expect(absOf("/shared//srv/alice/secret")).toBe(
 			path.resolve("/srv/shared/srv/alice/secret"),
 		);
+	});
+});
+
+describe("folder permissions", () => {
+	const alice = { username: "alice", readOnly: false };
+	const carol = { username: "carol", readOnly: false };
+
+	it("grants access via users or readOnlyUsers", () => {
+		expect(absOf("/view/x")).toBe(path.resolve("/srv/view/x"));
+		expect(() => resolve("/view/x", "bob")).toThrow(NotFound);
+		expect(
+			canAccessFolder(folder("f", [], { readOnlyUsers: "all" }), "x"),
+		).toBe(true);
+	});
+
+	it("only lets users write, never readOnlyUsers", () => {
+		expect(canWriteFolder(folder("f", ["alice"]), alice)).toBe(true);
+		expect(canWriteFolder(folder("f", "all"), carol)).toBe(true);
+		expect(
+			canWriteFolder(folder("f", [], { readOnlyUsers: ["alice"] }), alice),
+		).toBe(false);
+		expect(canWriteFolder(folder("f", ["bob"]), alice)).toBe(false);
+	});
+
+	it("is read-only when a user is in both lists", () => {
+		expect(
+			canWriteFolder(
+				folder("f", ["alice"], { readOnlyUsers: ["ALICE"] }),
+				alice,
+			),
+		).toBe(false);
+		expect(
+			canWriteFolder(folder("f", "all", { readOnlyUsers: ["alice"] }), alice),
+		).toBe(false);
+		expect(
+			canWriteFolder(folder("f", "all", { readOnlyUsers: ["alice"] }), carol),
+		).toBe(true);
+		expect(
+			canWriteFolder(folder("f", ["alice"], { readOnlyUsers: "all" }), alice),
+		).toBe(false);
+	});
+
+	it("respects user and folder readOnly flags", () => {
+		expect(
+			canWriteFolder(folder("f", ["alice"]), { ...alice, readOnly: true }),
+		).toBe(false);
+		expect(
+			canWriteFolder(folder("f", ["alice"], { readOnly: true }), alice),
+		).toBe(false);
 	});
 });
 

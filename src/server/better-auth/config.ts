@@ -9,12 +9,23 @@ import { username } from "better-auth/plugins";
 
 import { env } from "~/env";
 import { writeAudit } from "~/server/audit";
+import { username as usernameSchema } from "~/server/config";
 import { db } from "~/server/db";
 
-/** Best-effort client IP for the audit log. */
+/**
+ * Best-effort client IP for the audit log. Prefers Cloudflare's
+ * CF-Connecting-IP, which clients cannot set. Otherwise takes the last
+ * X-Forwarded-For entry (added by the nearest proxy); earlier entries are
+ * whatever the client sent.
+ */
 export function clientIp(headers: Headers | undefined) {
-	const forwarded = headers?.get("x-forwarded-for")?.split(",")[0]?.trim();
-	return forwarded || headers?.get("x-real-ip") || "unknown";
+	const forwarded = headers?.get("x-forwarded-for")?.split(",").at(-1)?.trim();
+	return (
+		headers?.get("cf-connecting-ip") ||
+		forwarded ||
+		headers?.get("x-real-ip") ||
+		"unknown"
+	);
 }
 
 function createAuth() {
@@ -24,14 +35,22 @@ function createAuth() {
 			provider: "pg",
 		}),
 		// Users come from config.yaml (see sync-users.ts); nobody signs up.
-		// Username login is built on email/password, so each user gets a
-		// placeholder email that is never shown or used.
+		// Usernames are email addresses; the user's email is set to the same.
 		emailAndPassword: {
 			enabled: true,
 			disableSignUp: true,
 			minPasswordLength: 1,
 		},
-		plugins: [username()],
+		plugins: [
+			username({
+				maxUsernameLength: 254,
+				usernameValidator: (name) => usernameSchema.safeParse(name).success,
+			}),
+		],
+		// Rate limiting is per client IP; see clientIp().
+		advanced: {
+			ipAddress: { ipAddressHeaders: ["cf-connecting-ip", "x-forwarded-for"] },
+		},
 		hooks: {
 			before: createAuthMiddleware(async (ctx) => {
 				if (ctx.path !== "/sign-out") return;

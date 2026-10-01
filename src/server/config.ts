@@ -39,10 +39,12 @@ const absolutePath = z
 	.min(1)
 	.refine((p) => path.isAbsolute(p), "Must be an absolute path");
 
-// Matches what Better Auth's username plugin accepts at sign-in.
-const username = z
+// Users sign in with their email address. Better Auth is configured to accept
+// the same (see better-auth/config.ts).
+export const username = z
 	.string()
-	.regex(/^[a-z0-9_.]{3,30}$/i, "Use 3-30 letters, digits, _ or .");
+	.email("Must be an email address")
+	.max(254, "Must be an email address");
 // Folder names appear in URLs, so keep them plain too.
 const folderName = z
 	.string()
@@ -51,18 +53,32 @@ const folderName = z
 		"Use letters, digits, spaces, _ . - (max 64 chars, no leading dot)",
 	);
 
+// Optional so a folder can have only readOnlyUsers (validated below).
+const folderUsers = z.union([z.literal("all"), z.array(username)]).default([]);
+
 export const configSchema = z
 	.object({
 		server: z.object({
 			cacheDir: absolutePath,
 			auditLog: absolutePath,
 			maxUploadSize: size,
+			// How often to rescan folders for changes made outside the app
+			// (e.g. over SMB). Unchanged directories are skipped. 0 turns it off.
+			indexIntervalMinutes: z.number().int().min(0).default(15),
+			// How many thumbnails to generate at once. Each reads the whole
+			// image, so lower is gentler on spinning disks. 0 turns them off.
+			thumbnailConcurrency: z.number().int().min(0).default(3),
 		}),
 		users: z
 			.array(
 				z.object({
 					username,
-					password: z.string().min(1),
+					// The login page may be public; rate limiting is only per IP.
+					// Any characters; the max is Better Auth's maxPasswordLength.
+					password: z
+						.string()
+						.min(12, "Use at least 12 characters")
+						.max(128, "Use at most 128 characters"),
 					readOnly: z.boolean().default(false),
 				}),
 			)
@@ -72,7 +88,9 @@ export const configSchema = z
 				z.object({
 					name: folderName,
 					path: absolutePath,
-					users: z.union([z.literal("all"), z.array(username).min(1)]),
+					// Read-write users; readOnlyUsers can list, download and preview.
+					users: folderUsers,
+					readOnlyUsers: folderUsers,
 					storageLimit: size.optional(),
 					readOnly: z.boolean().default(false),
 				}),
@@ -105,14 +123,24 @@ export const configSchema = z
 			}
 			names.add(key);
 
-			if (folder.users === "all") return;
-			for (const name of folder.users) {
-				if (!usernames.has(name.toLowerCase())) {
-					ctx.addIssue({
-						code: z.ZodIssueCode.custom,
-						path: ["folders", i, "users"],
-						message: `Unknown user "${name}"`,
-					});
+			if (folder.users.length === 0 && folder.readOnlyUsers.length === 0) {
+				ctx.addIssue({
+					code: z.ZodIssueCode.custom,
+					path: ["folders", i, "users"],
+					message: "Set users and/or readOnlyUsers",
+				});
+			}
+			for (const key of ["users", "readOnlyUsers"] as const) {
+				const list = folder[key];
+				if (list === "all") continue;
+				for (const name of list) {
+					if (!usernames.has(name.toLowerCase())) {
+						ctx.addIssue({
+							code: z.ZodIssueCode.custom,
+							path: ["folders", i, key],
+							message: `Unknown user "${name}"`,
+						});
+					}
 				}
 			}
 		});

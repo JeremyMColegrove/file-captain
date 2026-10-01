@@ -27,7 +27,6 @@ ENV HOSTNAME=0.0.0.0
 
 RUN groupadd --system nodejs && useradd --system --gid nodejs --shell /usr/sbin/nologin nextjs
 
-COPY --from=builder --chown=nextjs:nodejs /app/public ./public
 COPY --from=builder --chown=nextjs:nodejs /app/.next/standalone ./
 COPY --from=builder --chown=nextjs:nodejs /app/.next/static ./.next/static
 COPY --from=builder --chown=nextjs:nodejs /app/drizzle ./drizzle

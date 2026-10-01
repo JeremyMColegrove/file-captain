@@ -22,6 +22,7 @@ vi.mock("./search-index", () => ({
 	getChildren: async () => [],
 	upsertEntries: async () => {},
 	removeTree: async () => {},
+	removeEntries: async () => {},
 	moveTree: async () => {},
 }));
 
@@ -36,10 +37,10 @@ server:
   auditLog: ${path.join(tmp, "data", "audit.jsonl")}
   maxUploadSize: 1KB
 users:
-  - username: alice
-    password: pw
-  - username: bob
-    password: pw
+  - username: alice@example.com
+    password: test-password
+  - username: bob@example.com
+    password: test-password
 folders:
   - name: shared
     path: ${shared}
@@ -56,8 +57,12 @@ const { handleUpload } = await import("./uploads");
 const { initStorage } = await import("./file-service");
 const { Forbidden, NotFound } = await import("./errors");
 
-const alice = { username: "alice", readOnly: false, ip: "203.0.113.5" };
-const bob = { username: "bob", readOnly: false, ip: "203.0.113.6" };
+const alice = {
+	username: "alice@example.com",
+	readOnly: false,
+	ip: "203.0.113.5",
+};
+const bob = { username: "bob@example.com", readOnly: false, ip: "203.0.113.6" };
 const base = "http://localhost/api/upload";
 
 const b64 = (s: string) => Buffer.from(s).toString("base64");

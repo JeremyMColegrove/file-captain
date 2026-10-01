@@ -8,7 +8,11 @@ import { type FolderConfig, getConfig } from "./config";
 import { AppError, Forbidden, NotFound, toAppError } from "./errors";
 import type { AppUser } from "./file-service";
 import * as fileService from "./file-service";
-import { canAccessFolder, UPLOAD_STAGING_DIR } from "./safe-path";
+import {
+	canAccessFolder,
+	canWriteFolder,
+	UPLOAD_STAGING_DIR,
+} from "./safe-path";
 
 /**
  * tus (resumable upload) servers, one per folder. Chunks are staged in a
@@ -135,7 +139,7 @@ export async function handleUpload(
 	);
 	if (!folder) throw new NotFound();
 	// Checked here too so read-only folders never get a staging directory.
-	if (user.readOnly || folder.readOnly) {
+	if (!canWriteFolder(folder, user)) {
 		throw new Forbidden("This folder is read-only");
 	}
 	users.set(req, user);

@@ -5,9 +5,6 @@ import { db } from "~/server/db";
 import { session, user } from "~/server/db/schema";
 import { getAuth } from ".";
 
-const placeholderEmail = (username: string) =>
-	`${username}@users.file-captain.invalid`;
-
 /**
  * Makes the Better Auth user table match config.yaml: creates missing users,
  * updates changed passwords (signing that user out everywhere), and deletes
@@ -35,7 +32,7 @@ export async function syncUsers() {
 			const created = await ctx.internalAdapter.createUser(
 				{
 					name: configUser.username,
-					email: placeholderEmail(name),
+					email: name,
 					emailVerified: true,
 					username: name,
 					displayUsername: configUser.username,

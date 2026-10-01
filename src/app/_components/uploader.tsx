@@ -1,6 +1,7 @@
 "use client";
 
 import Uppy, { type UppyFile } from "@uppy/core";
+import DropTarget from "@uppy/drop-target";
 import Tus from "@uppy/tus";
 import {
 	CircleAlertIcon,
@@ -11,6 +12,7 @@ import {
 	XIcon,
 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
+import { toast } from "sonner";
 
 import { Button } from "~/components/ui/button";
 import {
@@ -21,7 +23,6 @@ import {
 	DialogFooter,
 	DialogHeader,
 	DialogTitle,
-	DialogTrigger,
 } from "~/components/ui/dialog";
 import { Progress } from "~/components/ui/progress";
 import {
@@ -30,7 +31,13 @@ import {
 	TooltipTrigger,
 } from "~/components/ui/tooltip";
 
-type Meta = { dir?: string; name: string; type?: string };
+type Meta = {
+	dir?: string;
+	name: string;
+	type?: string;
+	/** Set by DropTarget for files inside a dropped folder, e.g. docs/a.pdf. */
+	relativePath?: string | null;
+};
 type File = UppyFile<Meta, Record<string, never>>;
 
 /** Pulls the `{ error: { message } }` body our tus hooks send back. */
@@ -46,20 +53,29 @@ function errorMessage(response: unknown, fallback: string) {
 
 /**
  * Uploads into `dir` (a virtual path like /shared/photos) over tus. Stays
- * mounted so uploads keep going while the dialog is closed.
+ * mounted so uploads keep going while the dialog is closed or the folder
+ * changes. While `dropDir` is set, files dropped anywhere on the page upload
+ * there.
  */
 export function Uploader({
 	dir,
+	dropDir,
 	open,
 	onOpenChange,
 	onUploaded,
-	showButton,
+	onBusyChange,
+	onDropped,
 }: {
 	dir: string;
+	/** The writable folder on screen, or null when dropping isn't allowed. */
+	dropDir: string | null;
 	open: boolean;
 	onOpenChange: (open: boolean) => void;
 	onUploaded: (names: string[]) => void;
-	showButton: boolean;
+	/** Called with true while any upload is in progress. */
+	onBusyChange: (busy: boolean) => void;
+	/** Called after files are dropped on the page. */
+	onDropped: () => void;
 }) {
 	const [uppy, setUppy] = useState<Uppy<Meta, Record<string, never>> | null>(
 		null,
@@ -69,6 +85,12 @@ export function Uploader({
 	// Read when a file is added, so files keep the folder they were added in.
 	const dirRef = useRef(dir);
 	dirRef.current = dir;
+	const dropDirRef = useRef(dropDir);
+	dropDirRef.current = dropDir;
+	const onDroppedRef = useRef(onDropped);
+	onDroppedRef.current = onDropped;
+	// Set when a dropped folder's contents were skipped, reported on drop.
+	const skippedFolder = useRef(false);
 	const onUploadedRef = useRef(onUploaded);
 	onUploadedRef.current = onUploaded;
 
@@ -76,8 +98,17 @@ export function Uploader({
 		const instance = new Uppy<Meta, Record<string, never>>({
 			autoProceed: true,
 			onBeforeFileAdded: (file) => {
+				// Uploads go into one folder; recreating dropped trees is unsupported.
+				if (file.meta.relativePath?.includes("/")) {
+					skippedFolder.current = true;
+					return false;
+				}
 				// Files re-added for a retry keep their original folder.
-				const target = file.meta.dir ?? dirRef.current;
+				const target =
+					file.meta.dir ??
+					(file.source === "DropTarget"
+						? (dropDirRef.current ?? dirRef.current)
+						: dirRef.current);
 				const folder = target.split("/")[1] ?? "";
 				return {
 					...file,
@@ -113,6 +144,35 @@ export function Uploader({
 		return () => instance.destroy();
 	}, []);
 
+	// Page-wide drop target, only while a writable folder is on screen.
+	const droppable = dropDir !== null;
+	const overlayRef = useRef<HTMLDivElement>(null);
+	useEffect(() => {
+		if (!uppy || !droppable) return;
+		uppy.use(DropTarget, {
+			target: document.body,
+			onDragOver: () => setDragging(true),
+			// The overlay covers the page once shown, so leaving it means the
+			// drag left the window or was cancelled.
+			onDragLeave: (e) => {
+				if (e.target === overlayRef.current) setDragging(false);
+			},
+			onDrop: () => {
+				setDragging(false);
+				if (skippedFolder.current) {
+					skippedFolder.current = false;
+					toast.error("Folders can't be uploaded, only files.");
+				}
+				onDroppedRef.current();
+			},
+		});
+		return () => {
+			const plugin = uppy.getPlugin("DropTarget");
+			if (plugin) uppy.removePlugin(plugin);
+			setDragging(false);
+		};
+	}, [uppy, droppable]);
+
 	// Opening the dialog starts fresh: finished uploads are dropped so the drop
 	// area comes back. It is hidden while any upload is listed.
 	useEffect(() => {
@@ -136,80 +196,82 @@ export function Uploader({
 		(f) => f.progress.uploadStarted && !f.progress.uploadComplete && !f.error,
 	);
 	const finished = files.filter((f) => f.progress.uploadComplete);
+	const busy = active.length > 0;
+	const onBusyChangeRef = useRef(onBusyChange);
+	onBusyChangeRef.current = onBusyChange;
+	useEffect(() => {
+		onBusyChangeRef.current(busy);
+	}, [busy]);
 
 	return (
-		<Dialog onOpenChange={onOpenChange} open={open}>
-			{showButton && (
-				<DialogTrigger render={<Button disabled={!uppy} />}>
-					<UploadIcon />
-					{active.length > 0 ? `Uploading ${active.length}…` : "Upload"}
-				</DialogTrigger>
+		<>
+			{dragging && (
+				<div
+					className="fixed inset-0 z-[100] flex items-center justify-center bg-background/80 p-6 backdrop-blur-xs"
+					ref={overlayRef}
+				>
+					<div className="pointer-events-none flex flex-col items-center gap-3 rounded-xl border-2 border-primary border-dashed bg-popover px-16 py-12 text-center shadow-lg">
+						<UploadIcon className="size-8 text-primary" />
+						<p className="font-medium">Drop files to upload</p>
+						<p className="text-muted-foreground text-sm">to {dropDir}</p>
+					</div>
+				</div>
 			)}
-			<DialogContent className="sm:max-w-lg">
-				<DialogHeader>
-					<DialogTitle>Upload files</DialogTitle>
-					<DialogDescription>
-						Files are uploaded to {dir}. You can close this window while they
-						upload.
-					</DialogDescription>
-				</DialogHeader>
+			<Dialog onOpenChange={onOpenChange} open={open}>
+				<DialogContent className="sm:max-w-lg">
+					<DialogHeader>
+						<DialogTitle>Upload files</DialogTitle>
+						<DialogDescription>
+							Files are uploaded to {dir}. You can close this window while they
+							upload.
+						</DialogDescription>
+					</DialogHeader>
 
-				{files.length === 0 && (
-					<label
-						className={`flex cursor-pointer flex-col items-center justify-center gap-2 rounded-lg border border-dashed p-8 text-center text-muted-foreground text-sm transition-colors hover:bg-muted/50 ${dragging ? "border-primary bg-muted/50" : ""}`}
-						onDragLeave={() => setDragging(false)}
-						onDragOver={(e) => {
-							e.preventDefault();
-							setDragging(true);
-						}}
-						onDrop={(e) => {
-							e.preventDefault();
-							setDragging(false);
-							add(e.dataTransfer.files);
-						}}
-					>
-						<UploadIcon className="size-6" />
-						<span>Drop files here or click to browse</span>
-						<input
-							className="sr-only"
-							multiple
-							onChange={(e) => {
-								add(e.target.files);
-								e.target.value = "";
-							}}
-							type="file"
-						/>
-					</label>
-				)}
-
-				{files.length > 0 && (
-					<ul className="flex max-h-72 flex-col gap-3 overflow-y-auto">
-						{files.map((file) => (
-							<UploadRow
-								file={file}
-								key={file.id}
-								onRemove={() => uppy?.removeFile(file.id)}
-								onRetry={() => void uppy?.retryUpload(file.id)}
+					{files.length === 0 && (
+						<label className="flex cursor-pointer flex-col items-center justify-center gap-2 rounded-lg border border-dashed p-8 text-center text-muted-foreground text-sm transition-colors hover:bg-muted/50">
+							<UploadIcon className="size-6" />
+							<span>Drop files here or click to browse</span>
+							<input
+								className="sr-only"
+								multiple
+								onChange={(e) => {
+									add(e.target.files);
+									e.target.value = "";
+								}}
+								type="file"
 							/>
-						))}
-					</ul>
-				)}
-
-				<DialogFooter>
-					{finished.length > 0 && (
-						<Button
-							onClick={() => {
-								for (const f of finished) uppy?.removeFile(f.id);
-							}}
-							variant="outline"
-						>
-							Clear finished
-						</Button>
+						</label>
 					)}
-					<DialogClose render={<Button />}>Close</DialogClose>
-				</DialogFooter>
-			</DialogContent>
-		</Dialog>
+
+					{files.length > 0 && (
+						<ul className="flex max-h-72 flex-col gap-3 overflow-y-auto">
+							{files.map((file) => (
+								<UploadRow
+									file={file}
+									key={file.id}
+									onRemove={() => uppy?.removeFile(file.id)}
+									onRetry={() => void uppy?.retryUpload(file.id)}
+								/>
+							))}
+						</ul>
+					)}
+
+					<DialogFooter>
+						{finished.length > 0 && (
+							<Button
+								onClick={() => {
+									for (const f of finished) uppy?.removeFile(f.id);
+								}}
+								variant="outline"
+							>
+								Clear finished
+							</Button>
+						)}
+						<DialogClose render={<Button />}>Close</DialogClose>
+					</DialogFooter>
+				</DialogContent>
+			</Dialog>
+		</>
 	);
 }
 
