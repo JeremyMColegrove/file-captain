@@ -13,6 +13,9 @@ export type Listing = { entries: Entry[]; writable: boolean };
 /** Mirrors the /api/files/search response. */
 export type SearchResult = Entry & { path: string };
 
+/** Mirrors the /api/files/sizes response: bytes per subdirectory, null while indexing. */
+export type DirSizes = { sizes: Record<string, number> | null };
+
 /** Mirrors the /api/files/status response. */
 export type Status = { indexing: boolean };
 

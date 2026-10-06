@@ -10,13 +10,13 @@ import {
 	CircleAlertIcon,
 	CircleCheckIcon,
 	FileIcon,
+	FolderUpIcon,
 	Loader2Icon,
 	RotateCwIcon,
 	UploadIcon,
 	XIcon,
 } from "lucide-react";
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
-import { toast } from "sonner";
 
 import { Button } from "~/components/ui/button";
 import {
@@ -36,7 +36,7 @@ type Meta = {
 	dir?: string;
 	name: string;
 	type?: string;
-	/** Set by DropTarget for files inside a dropped folder, e.g. docs/a.pdf. */
+	/** Set for files inside an uploaded folder, e.g. docs/a.pdf. */
 	relativePath?: string | null;
 };
 type File = UppyFile<Meta, Record<string, never>>;
@@ -100,8 +100,6 @@ export function Uploader({
 	dropDirRef.current = dropDir;
 	const onOpenChangeRef = useRef(onOpenChange);
 	onOpenChangeRef.current = onOpenChange;
-	// Set when a dropped folder's contents were skipped, reported on drop.
-	const skippedFolder = useRef(false);
 	const onUploadedRef = useRef(onUploaded);
 	onUploadedRef.current = onUploaded;
 	// The HTTP status of each failed upload; 4xx failures won't succeed on retry.
@@ -111,17 +109,15 @@ export function Uploader({
 		const instance = new Uppy<Meta, Record<string, never>>({
 			autoProceed: true,
 			onBeforeFileAdded: (file, files) => {
-				// Uploads go into one folder; recreating dropped trees is unsupported.
-				if (file.meta.relativePath?.includes("/")) {
-					skippedFolder.current = true;
-					return false;
-				}
-				// Files re-added for a retry keep their original folder.
-				const target =
-					file.meta.dir ??
-					(file.source === "DropTarget"
+				const base =
+					file.source === "DropTarget"
 						? (dropDirRef.current ?? dirRef.current)
-						: dirRef.current);
+						: dirRef.current;
+				// Files of an uploaded folder go into the same subfolders; the
+				// server creates missing ones and merges into existing ones.
+				const sub = file.meta.relativePath?.split("/").slice(0, -1).join("/");
+				// Files re-added for a retry keep their original folder.
+				const target = file.meta.dir ?? (sub ? `${base}/${sub}` : base);
 				const folder = target.split("/")[1] ?? "";
 				// Uppy identifies a file by its name, type, size and date only.
 				// The same file sent to two folders is two uploads: two rows in
@@ -212,10 +208,6 @@ export function Uploader({
 			},
 			onDrop: () => {
 				setDragging(false);
-				if (skippedFolder.current) {
-					skippedFolder.current = false;
-					toast.error("Folders can't be uploaded, only files.");
-				}
 				// Progress shows in the panel; the dialog (if open) would hide it.
 				onOpenChangeRef.current(false);
 			},
@@ -237,6 +229,11 @@ export function Uploader({
 					name: data.name,
 					type: data.type,
 					data,
+					// Set when a folder was picked, e.g. docs/a.pdf.
+					meta: {
+						name: data.name,
+						relativePath: data.webkitRelativePath || null,
+					},
 				})),
 			);
 		} catch {
@@ -272,7 +269,7 @@ export function Uploader({
 				>
 					<div className="pointer-events-none flex flex-col items-center gap-3 rounded-xl border-2 border-primary border-dashed bg-popover px-16 py-12 text-center shadow-lg">
 						<UploadIcon className="size-8 text-primary" />
-						<p className="font-medium">Drop files to upload</p>
+						<p className="font-medium">Drop files or folders to upload</p>
 						<p className="text-muted-foreground text-sm">to {dropDir}</p>
 					</div>
 				</div>
@@ -280,26 +277,47 @@ export function Uploader({
 			<Dialog onOpenChange={onOpenChange} open={open}>
 				<DialogContent className="sm:max-w-lg" data-keep-selection>
 					<DialogHeader>
-						<DialogTitle>Upload files</DialogTitle>
+						<DialogTitle>Upload</DialogTitle>
 						<DialogDescription>
-							Files are uploaded to {dir}. Progress shows in the corner, and you
-							can keep browsing meanwhile.
+							Files and folders are uploaded to {dir}. Folders that already
+							exist are merged into. Progress shows in the corner, and you can
+							keep browsing meanwhile.
 						</DialogDescription>
 					</DialogHeader>
 
-					<label className="flex cursor-pointer flex-col items-center justify-center gap-2 rounded-lg border border-dashed p-8 text-center text-muted-foreground text-sm transition-colors hover:bg-muted/50">
-						<UploadIcon className="size-6" />
-						<span>Drop files here or click to browse</span>
-						<input
-							className="sr-only"
-							multiple
-							onChange={(e) => {
-								add(e.target.files);
-								e.target.value = "";
-							}}
-							type="file"
-						/>
-					</label>
+					<div className="grid grid-cols-2 gap-3">
+						<label className="flex cursor-pointer flex-col items-center justify-center gap-2 rounded-lg border border-dashed p-8 text-center text-muted-foreground text-sm transition-colors focus-within:bg-muted/50 hover:bg-muted/50">
+							<UploadIcon className="size-6" />
+							<span>Choose files</span>
+							<input
+								className="sr-only"
+								multiple
+								onChange={(e) => {
+									add(e.target.files);
+									e.target.value = "";
+								}}
+								type="file"
+							/>
+						</label>
+						<label className="flex cursor-pointer flex-col items-center justify-center gap-2 rounded-lg border border-dashed p-8 text-center text-muted-foreground text-sm transition-colors focus-within:bg-muted/50 hover:bg-muted/50">
+							<FolderUpIcon className="size-6" />
+							<span>Choose a folder</span>
+							<input
+								className="sr-only"
+								onChange={(e) => {
+									add(e.target.files);
+									e.target.value = "";
+								}}
+								// Not in React's types; picks a folder and everything in it.
+								ref={(el) => el?.setAttribute("webkitdirectory", "")}
+								type="file"
+							/>
+						</label>
+					</div>
+					<p className="text-center text-muted-foreground text-xs">
+						Or drop files and folders anywhere on the page. Empty folders are
+						skipped.
+					</p>
 
 					<DialogFooter>
 						<DialogClose render={<Button variant="outline" />}>
@@ -575,7 +593,12 @@ function UploadRow({
 				<FileIcon className="size-4 shrink-0 text-muted-foreground" />
 			)}
 			<div className="flex min-w-0 flex-1 flex-col gap-1">
-				<p className="truncate text-sm">{file.name}</p>
+				<p
+					className="truncate text-sm"
+					title={file.meta.relativePath ?? undefined}
+				>
+					{file.meta.relativePath ?? file.name}
+				</p>
 				{status === "sending" ? (
 					<Progress aria-label={detail} value={percent} />
 				) : (

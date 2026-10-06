@@ -138,6 +138,39 @@ export async function folderSize(folder: string): Promise<number> {
 	return Number(row?.bytes ?? 0);
 }
 
+/**
+ * Total bytes of the files below each subdirectory of `parent`, by name.
+ * Subdirectories without files are missing. One scan of `parent`'s subtree.
+ */
+export async function subdirSizes(
+	folder: string,
+	parent: string,
+): Promise<Map<string, number>> {
+	const prefix = parent === "/" ? "/" : `${parent}/`;
+	// The part of the path after `prefix`, e.g. `photos/2024/a.jpg`.
+	// substr counts code points, not UTF-16 units like `prefix.length`. Inlined,
+	// not a bound parameter: Postgres only matches the select and GROUP BY
+	// expressions if they're identical, and $1 differs from $3.
+	const start = [...prefix].length + 1;
+	const rest = sql`substr(${fileIndex.path}, ${sql.raw(String(start))})`;
+	const name = sql<string>`split_part(${rest}, '/', 1)`;
+	const rows = await db
+		.select({ name, bytes: sql<string>`sum(${fileIndex.size})` })
+		.from(fileIndex)
+		.where(
+			and(
+				eq(fileIndex.folder, folder),
+				eq(fileIndex.isDir, false),
+				like(fileIndex.path, `${escapeLike(prefix)}%`),
+				// Below a subdirectory, not a file directly in `parent`.
+				sql`strpos(${rest}, '/') > 0`,
+			),
+		)
+		.groupBy(name);
+	// Postgres returns sum(bigint) as numeric, which arrives as a string.
+	return new Map(rows.map((r) => [r.name, Number(r.bytes)]));
+}
+
 /** Drops rows of folders that are no longer in config.yaml. */
 export async function keepFolders(folders: string[]) {
 	await db

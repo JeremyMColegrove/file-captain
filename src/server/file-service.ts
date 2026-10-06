@@ -522,6 +522,25 @@ export async function list(
 	};
 }
 
+/**
+ * Total bytes of the files below each subdirectory of `virtualPath`, by name,
+ * summed from the search index. Null until the first index sync finishes, as
+ * the totals would be incomplete. Fetched after the listing, so a large tree
+ * doesn't slow it down.
+ */
+export async function dirSizes(
+	user: AppUser,
+	virtualPath: string,
+): Promise<Record<string, number> | null> {
+	const resolved = resolveInFolder(user, virtualPath);
+	if (!indexing.fileCaptainIndexed) return null;
+	const sizes = await searchIndex.subdirSizes(
+		resolved.folder.name,
+		relPath(resolved),
+	);
+	return Object.fromEntries(sizes);
+}
+
 export type SearchResult = Entry & {
 	/** Virtual path of the match, e.g. `/shared/photos/a.jpg`. */
 	path: string;
@@ -823,6 +842,53 @@ export async function getThumbnail(
 }
 
 /** Checks an upload target before any bytes arrive. Audits only rejections. */
+/**
+ * The directories above an upload's target that don't exist yet, outermost
+ * first, so an uploaded folder keeps its structure. Existing directories are
+ * merged into. Throws if a file is in the way or a name is invalid.
+ */
+async function missingParents(
+	user: AppUser,
+	target: FolderPath,
+): Promise<FolderPath[]> {
+	const missing: FolderPath[] = [];
+	let dir = resolveInFolder(user, path.posix.dirname(target.virtualPath));
+	for (;;) {
+		const info = await stat(dir.absPath).catch(() => null);
+		if (info?.isDirectory()) return missing.reverse();
+		if (info) throw new Conflict("A file is in the way of that folder");
+		if (dir.isFolderRoot) throw new NotFound("Folder not found");
+		if (!isValidName(path.basename(dir.absPath)))
+			throw new BadRequest("Invalid name");
+		missing.push(dir);
+		dir = resolveInFolder(user, path.posix.dirname(dir.virtualPath));
+	}
+}
+
+/** Creates an upload's missing parent directories, auditing each as a mkdir. */
+async function createParents(user: AppUser, target: FolderPath) {
+	for (const dir of await missingParents(user, target)) {
+		const entry = {
+			user: user.username,
+			action: "mkdir" as const,
+			src: dir.virtualPath,
+			ip: user.ip,
+		};
+		try {
+			await assertFree(dir.absPath);
+			await fsMkdir(dir.absPath);
+		} catch (err) {
+			// Files of one folder finish in parallel; another created it first.
+			const info = await stat(dir.absPath).catch(() => null);
+			if (info?.isDirectory()) continue;
+			await writeAudit({ ...entry, result: "error" });
+			throw err;
+		}
+		await writeAudit({ ...entry, result: "ok" });
+		await indexAdded(dir);
+	}
+}
+
 export async function checkUpload(
 	user: AppUser,
 	targetPath: string,
@@ -832,8 +898,8 @@ export async function checkUpload(
 		const target = resolveWritable(user, targetPath);
 		if (!isValidName(path.basename(target.absPath)))
 			throw new BadRequest("Invalid name");
-		const parent = await stat(path.dirname(target.absPath)).catch(() => null);
-		if (!parent?.isDirectory()) throw new NotFound("Folder not found");
+		// Missing parents are created when the upload finishes.
+		await missingParents(user, target);
 		await assertFree(target.absPath);
 		await assertSpace(target.folder, size);
 	} catch (err) {
@@ -865,6 +931,7 @@ export function finalizeUpload(
 			// Re-checked: other uploads may have finished meanwhile.
 			const bytes = hasLimit(target.folder) ? await treeSize(stagedPath) : 0;
 			await assertSpace(target.folder, bytes);
+			await createParents(user, target);
 			await assertFree(target.absPath);
 			try {
 				// link() fails with EEXIST instead of replacing, unlike rename().

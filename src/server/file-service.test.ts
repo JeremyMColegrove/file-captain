@@ -84,6 +84,20 @@ vi.mock("./search-index", () => {
 			[...index.rows.values()]
 				.filter((r) => r.folder === folder && !r.isDir)
 				.reduce((sum, r) => sum + r.size, 0),
+		subdirSizes: async (folder: string, parent: string) => {
+			const prefix = parent === "/" ? "/" : `${parent}/`;
+			const sizes = new Map<string, number>();
+			for (const r of index.rows.values()) {
+				if (r.folder !== folder || r.isDir || !r.path.startsWith(prefix)) {
+					continue;
+				}
+				const rest = r.path.slice(prefix.length);
+				if (!rest.includes("/")) continue;
+				const name = rest.slice(0, rest.indexOf("/"));
+				sizes.set(name, (sizes.get(name) ?? 0) + r.size);
+			}
+			return sizes;
+		},
 		keepFolders: async (folders: string[]) => {
 			for (const [k, r] of index.rows) {
 				if (!folders.includes(r.folder)) index.rows.delete(k);
@@ -727,7 +741,7 @@ describe("uploads", () => {
 		expect(await auditEntries()).toEqual([]);
 	});
 
-	it("checkUpload rejects conflicts, read-only targets and missing folders", async () => {
+	it("checkUpload rejects conflicts, read-only targets and files in the way", async () => {
 		await expect(fs.checkUpload(alice, "/shared/a.txt", 1)).rejects.toThrow(
 			Conflict,
 		);
@@ -738,8 +752,8 @@ describe("uploads", () => {
 			Forbidden,
 		);
 		await expect(
-			fs.checkUpload(alice, "/shared/nope/x.txt", 1),
-		).rejects.toThrow(NotFound);
+			fs.checkUpload(alice, "/shared/a.txt/x.txt", 1),
+		).rejects.toThrow(Conflict);
 		await expect(fs.checkUpload(alice, "/shared/../x.txt", 1)).rejects.toThrow(
 			BadRequest,
 		);
@@ -785,6 +799,84 @@ describe("uploads", () => {
 			fs.finalizeUpload(alice, staged(), "/shared/Pic.jpg"),
 		).rejects.toThrow(Conflict);
 		expect(await readdir(dirs.shared)).not.toContain("Pic.jpg");
+	});
+
+	it("checkUpload accepts missing parents without creating them", async () => {
+		await fs.checkUpload(alice, "/shared/new/sub/x.txt", 1);
+		await expect(stat(path.join(dirs.shared, "new"))).rejects.toThrow();
+		expect(await auditEntries()).toEqual([]);
+	});
+
+	it("finalizeUpload creates missing parents and audits each as mkdir", async () => {
+		await fs.finalizeUpload(alice, staged(), "/shared/docs/new/sub/x.txt");
+		expect(
+			await readFile(
+				path.join(dirs.shared, "docs", "new", "sub", "x.txt"),
+				"utf8",
+			),
+		).toBe("uploaded bytes");
+		const entries = await auditEntries();
+		expect(entries.map((e) => [e.action, e.src, e.result])).toEqual([
+			["mkdir", "/shared/docs/new", "ok"],
+			["mkdir", "/shared/docs/new/sub", "ok"],
+			["upload", "/shared/docs/new/sub/x.txt", "ok"],
+		]);
+		expect(index.rows.has("shared\0/docs/new/sub")).toBe(true);
+	});
+
+	it("finalizeUpload merges into existing folders", async () => {
+		await fs.finalizeUpload(alice, staged(), "/shared/docs/deep/c.txt");
+		expect(await readdir(path.join(dirs.shared, "docs", "deep"))).toEqual([
+			"b.txt",
+			"c.txt",
+		]);
+		const entries = await auditEntries();
+		expect(entries.map((e) => e.action)).toEqual(["upload"]);
+	});
+
+	it("files of one new folder finishing together create it once", async () => {
+		const second = path.join(tmp, "data", "staged2.bin");
+		await writeFile(second, "more bytes");
+		await Promise.all([
+			fs.finalizeUpload(alice, staged(), "/shared/new/a.txt"),
+			fs.finalizeUpload(alice, second, "/shared/new/b.txt"),
+		]);
+		expect((await readdir(path.join(dirs.shared, "new"))).sort()).toEqual([
+			"a.txt",
+			"b.txt",
+		]);
+		const entries = await auditEntries();
+		expect(entries.filter((e) => e.action === "mkdir")).toHaveLength(1);
+		expect(entries.every((e) => e.result === "ok")).toBe(true);
+	});
+
+	it("finalizeUpload never creates a second folder differing only in case", async () => {
+		// Case-insensitive disks (macOS) merge into docs; others get a Conflict.
+		await fs
+			.finalizeUpload(alice, staged(), "/shared/DOCS/x.txt")
+			.catch((err) => expect(err).toBeInstanceOf(Conflict));
+		await writeFile(staged(), "uploaded bytes");
+		await expect(
+			fs.finalizeUpload(alice, staged(), "/shared/a.txt/x.txt"),
+		).rejects.toThrow(Conflict);
+		expect((await readdir(dirs.shared)).sort()).toEqual([
+			"a.txt",
+			"docs",
+			"pic.JPG",
+		]);
+	});
+
+	it("rejects folder uploads into the staging directory or read-only places", async () => {
+		await expect(
+			fs.checkUpload(alice, "/shared/.file-captain-uploads/x/y.txt", 1),
+		).rejects.toThrow(NotFound);
+		await expect(
+			fs.checkUpload(alice, "/archive/new/y.txt", 1),
+		).rejects.toThrow(Forbidden);
+		await expect(
+			fs.finalizeUpload(guest, staged(), "/shared/new/y.txt"),
+		).rejects.toThrow(Forbidden);
+		await expect(stat(path.join(dirs.shared, "new"))).rejects.toThrow();
 	});
 
 	it("finalizeUpload refuses read-only users", async () => {
@@ -991,6 +1083,28 @@ describe("search index", () => {
 		const later = fs.indexFiles();
 		expect(fs.status(alice).indexing).toBe(false);
 		await later;
+	});
+
+	it("sums the files below each subdirectory", async () => {
+		await mkdir(path.join(dirs.shared, "docs", "empty"));
+		await writeFile(path.join(dirs.shared, "docs", "c.txt"), "cc");
+		await mkdir(path.join(dirs.shared, "docs2"));
+		await writeFile(path.join(dirs.shared, "docs2", "d.txt"), "ddd");
+		await fs.indexFiles();
+
+		// Files directly in the folder don't count; "docs2" isn't part of "docs".
+		expect(await fs.dirSizes(alice, "/shared")).toEqual({ docs: 3, docs2: 3 });
+		expect(await fs.dirSizes(alice, "/shared/docs")).toEqual({ deep: 1 });
+		await expect(fs.dirSizes(guest, "/alice")).rejects.toThrow(NotFound);
+		await expect(fs.dirSizes(alice, "/")).rejects.toThrow(BadRequest);
+	});
+
+	it("has no folder sizes until the first sync finishes", async () => {
+		const state = globalThis as { fileCaptainIndexed?: boolean };
+		state.fileCaptainIndexed = undefined;
+		expect(await fs.dirSizes(alice, "/shared")).toBeNull();
+		await fs.indexFiles();
+		expect(await fs.dirSizes(alice, "/shared")).toEqual({ docs: 1 });
 	});
 
 	it("searches only the user's folders and returns virtual paths", async () => {

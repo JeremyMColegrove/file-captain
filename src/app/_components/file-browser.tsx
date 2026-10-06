@@ -92,6 +92,7 @@ import {
 import {
 	ApiError,
 	api,
+	type DirSizes,
 	type Entry,
 	join,
 	type Listing,
@@ -612,6 +613,25 @@ export function FolderView({
 			name === null ? null : { path, names: [name], anchor: name, lead: name },
 		);
 	const rows = useMemo(() => sortEntries(listing.entries), [listing.entries]);
+
+	// Folder sizes come from the search index in a second request, so a large
+	// tree doesn't hold up the listing. Refetched whenever the listing changes;
+	// a refresh keeps showing the old sizes until the new ones arrive.
+	const [loaded, setLoaded] = useState<{ path: string } & DirSizes>();
+	// biome-ignore lint/correctness/useExhaustiveDependencies: refetches per listing, see above
+	useEffect(() => {
+		if (path === "/") return;
+		let stale = false;
+		api<DirSizes>(`/api/files/sizes${q(path)}`)
+			.then(({ sizes }) => {
+				if (!stale) setLoaded({ path, sizes });
+			})
+			.catch(() => {}); // sizes are a nicety; the column just stays blank
+		return () => {
+			stale = true;
+		};
+	}, [path, listing]);
+	const dirSizes = loaded?.path === path ? loaded.sizes : null;
 
 	// Files dropped anywhere on the page upload into this folder.
 	const { setDropDir } = shell;
@@ -1159,6 +1179,7 @@ export function FolderView({
 				>
 					<FileTable
 						anchor={selected?.path === path ? selected.anchor : null}
+						dirSizes={dirSizes}
 						entries={rows}
 						lead={selected?.path === path ? selected.lead : null}
 						onOpen={openEntry}
@@ -1284,6 +1305,7 @@ function FileTableHeader() {
 function FileTable({
 	path,
 	entries,
+	dirSizes,
 	selected,
 	anchor,
 	lead,
@@ -1292,6 +1314,8 @@ function FileTable({
 }: {
 	path: string;
 	entries: Entry[];
+	/** Bytes below each subdirectory, by name; null until loaded. */
+	dirSizes: DirSizes["sizes"];
 	selected: string[];
 	anchor: string | null;
 	lead: string | null;
@@ -1401,7 +1425,11 @@ function FileTable({
 								</div>
 							</TableCell>
 							<TableCell className="hidden text-right text-muted-foreground tabular-nums sm:table-cell">
-								{entry.type === "file" ? formatSize(entry.size) : ""}
+								{entry.type === "file"
+									? formatSize(entry.size)
+									: dirSizes
+										? formatSize(dirSizes[entry.name] ?? 0)
+										: ""}
 							</TableCell>
 							<TableCell className="hidden text-muted-foreground md:table-cell">
 								{formatShortDate(entry.mtime)}
